@@ -4,6 +4,7 @@
 #include <fstream>
 #include <vector>
 
+#include "context_fabric/storage/flashtier_adapter.h"
 #include "context_fabric/storage/host_memory_backend.h"
 #include "context_fabric/storage/persistent_backend.h"
 #include "context_fabric/core/integrity.h"
@@ -12,6 +13,13 @@
 using namespace ctf;
 
 namespace fs = std::filesystem;
+
+CF_TEST(flashtier_adapter_absent_by_default) {
+    // Context Fabric builds and runs without FlashTier; the factory returns
+    // nullptr and the node keeps using its own backends.
+    FlashTierResidency* adapter = create_flashtier_adapter();
+    CF_CHECK(adapter == nullptr);
+}
 
 CF_TEST(host_memory_capacity_enforced) {
     HostMemoryBackend host(1024);

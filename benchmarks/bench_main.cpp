@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
                 cfg.coord_port = static_cast<uint16_t>(std::atoi(c.substr(colon + 1).c_str()));
             }
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("usage: context-fabric-bench [--quick] [--cuda] [--size BYTES] [--coordinator host:port]\n");
+            std::printf("usage: context_fabric_bench [--quick] [--cuda] [--size BYTES] [--coordinator host:port]\n");
             return 0;
         }
     }

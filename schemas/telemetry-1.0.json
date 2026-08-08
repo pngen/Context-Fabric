@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Context Fabric telemetry event (JSON Lines)",
+  "description": "One JSON object per line in each node's/coordinator's telemetry stream. All telemetry is local; nothing leaves the node.",
+  "type": "object",
+  "required": ["event", "envelope", "doc"],
+  "properties": {
+    "event": {
+      "type": "string",
+      "description": "Event type, e.g. node.register, object.create_requested, coordinator.op_committed, lease.acquire, recovery.promoted_replica."
+    },
+    "envelope": {
+      "type": "object",
+      "required": ["schema", "seq", "t_unix_ms", "node", "epoch"],
+      "properties": {
+        "schema": { "type": "integer", "const": 1 },
+        "seq": { "type": "integer", "description": "Monotonic per-node sequence." },
+        "t_unix_ms": { "type": "integer", "description": "Wall-clock timestamp in ms." },
+        "node": { "type": "integer", "description": "Emitting node id (0 = coordinator)." },
+        "epoch": { "type": "integer", "description": "Coordinator epoch at emit time." }
+      }
+    },
+    "doc": {
+      "type": "object",
+      "description": "Event-specific fields. Common fields: id (object id hex), gen (generation), bytes, duration_ms, crc32c, sha, reason, error.",
+      "properties": {
+        "id": { "type": "string" },
+        "gen": { "type": "integer" },
+        "bytes": { "type": "integer" },
+        "duration_ms": { "type": "integer" },
+        "crc32c": { "type": "integer" },
+        "sha": { "type": "integer" },
+        "reason": { "type": "string" },
+        "error": { "type": "string" }
+      }
+    }
+  }
+}

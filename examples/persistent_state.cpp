@@ -13,6 +13,7 @@
 #include "context_fabric/authority/coordinator.h"
 #include "context_fabric/core/prng.h"
 #include "context_fabric/runtime/node_runtime.h"
+#include "example_util.h"
 
 using namespace ctf;
 
@@ -65,7 +66,7 @@ int main() {
         md.persistence = PersistencePolicy::Persistent;
         md.compatibility_fingerprint = md.compute_compatibility_fingerprint();
 
-        id = cf.create_object(md, n, content);
+        id = create_object_wait_registered(cf, md, n, content);
         std::printf("created %s\n", id.to_hex().c_str());
         cf.persist(id, n);
         std::printf("persisted\n");
@@ -106,7 +107,7 @@ int main() {
                     lifecycle_state_name(static_cast<LifecycleState>(ir.lifecycle)),
                     static_cast<unsigned long long>(ir.authoritative_node));
 
-        auto res = cf.restore(id, n);
+        auto res = restore_wait_registered(cf, id, n);
         std::printf("restored to node %llu\n", static_cast<unsigned long long>(res.node_id));
 
         auto vr = cf.verify(id, n, true);

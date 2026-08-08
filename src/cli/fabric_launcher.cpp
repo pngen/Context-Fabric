@@ -10,6 +10,9 @@
 #include "context_fabric/core/byte_size_util.h"
 #include "context_fabric/core/prng.h"
 #include "context_fabric/core/version.h"
+#if defined(CONTEXT_FABRIC_BUILD_BENCHMARKS)
+#include "bench_suite.h"
+#endif
 #include "cli.h"
 
 #if defined(_WIN32)
@@ -219,6 +222,7 @@ int FabricLauncher::run(const Config& cfg) {
             }
 
             // migrate to node-c (keep source)
+            size_t last = cfg.node_count - 1;
             if (cfg.node_count >= 3) {
                 auto loc = cf.migrate(id, node_ids[2], StorageDomain::HostMemory, true);
                 std::printf("fabric: migrated to node %llu\n", static_cast<unsigned long long>(loc.node_id));
@@ -229,13 +233,13 @@ int FabricLauncher::run(const Config& cfg) {
             }
 
             // persist + restore
-            uint64_t pnode = cf.persist(id, node_ids[2]);
+            uint64_t pnode = cf.persist(id, node_ids[last]);
             std::printf("fabric: persisted on node %llu\n", static_cast<unsigned long long>(pnode));
             auto loc = cf.restore(id, node_ids[0]);
             std::printf("fabric: restored to node %llu\n", static_cast<unsigned long long>(loc.node_id));
 
             // transfer versus recompute decision
-            auto dec = cf.decide_transfer_vs_recompute(md, node_ids[0], node_ids[2], 1e9);
+            auto dec = cf.decide_transfer_vs_recompute(md, node_ids[0], node_ids[last], 1e9);
             std::printf("fabric: decision=%s reason=%s\n", dec.chose_transfer ? "transfer" : "recompute",
                         dec.reason.c_str());
 
@@ -281,12 +285,30 @@ int FabricLauncher::run(const Config& cfg) {
 }
 
 int run_benchmarks(const Args& args, const std::string& host, uint16_t port, bool have_coord) {
+#if defined(CONTEXT_FABRIC_BUILD_BENCHMARKS)
+    BenchConfig cfg;
+    if (have_coord) {
+        cfg.coord_host = host;
+        cfg.coord_port = port;
+    }
+    cfg.quick = args.has("quick");
+    cfg.cuda = args.has("cuda");
+    if (args.has("size")) {
+        auto s = args.value("size");
+        if (s) {
+            uint64_t v = 0;
+            if (parse_byte_size(*s, v)) cfg.object_size = v;
+        }
+    }
+    return run_benchmark_suite(cfg);
+#else
     (void)args;
     (void)host;
     (void)port;
     (void)have_coord;
-    std::printf("context-fabric benchmarks: run `context-fabric-bench` for the full suite\n");
+    std::printf("context-fabric benchmarks: build with CONTEXT_FABRIC_BUILD_BENCHMARKS=ON\n");
     return 0;
+#endif
 }
 
 }  // namespace ctf

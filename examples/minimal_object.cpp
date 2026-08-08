@@ -7,8 +7,6 @@
 
 #include <cstdio>
 #include <exception>
-#include <chrono>
-#include <thread>
 #include <filesystem>
 #include <memory>
 
@@ -16,6 +14,7 @@
 #include "context_fabric/authority/coordinator.h"
 #include "context_fabric/core/prng.h"
 #include "context_fabric/runtime/node_runtime.h"
+#include "example_util.h"
 
 using namespace ctf;
 
@@ -86,22 +85,7 @@ int main(int argc, char** argv) {
 
     auto content = generate_content(1, 1, 4096);
     try {
-        // Wait for the node to register before creating.
-        ObjectId id;
-        bool created = false;
-        for (int i = 0; i < 100 && !created; ++i) {
-            try {
-                id = cf.create_object(md, nid.value(), content);
-                created = true;
-            } catch (const CfError& e) {
-                if (e.kind() != ErrKind::NotFound && e.kind() != ErrKind::State) throw;
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
-        }
-        if (!created) {
-            std::fprintf(stderr, "object creation did not complete\n");
-            return 1;
-        }
+        ObjectId id = create_object_wait_registered(cf, md, nid.value(), content);
         std::printf("created object %s\n", id.to_hex().c_str());
 
         auto ir = cf.inspect(id);

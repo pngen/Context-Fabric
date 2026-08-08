@@ -41,6 +41,7 @@ add_library(context_fabric_storage STATIC
   storage/host_memory_backend.cpp
   storage/persistent_backend.cpp
   storage/accelerator_backend.cpp
+  storage/flashtier_adapter.cpp
 )
 target_include_directories(context_fabric_storage PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(context_fabric_storage PUBLIC context_fabric_core)
@@ -132,6 +133,11 @@ if(CONTEXT_FABRIC_BUILD_CLI)
   )
   target_include_directories(context-fabric PRIVATE ${PROJECT_SOURCE_DIR}/include)
   target_include_directories(context-fabric PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cli)
+  if(CONTEXT_FABRIC_BUILD_BENCHMARKS)
+    target_include_directories(context-fabric PRIVATE ${PROJECT_SOURCE_DIR}/benchmarks)
+    target_link_libraries(context-fabric PRIVATE context_fabric_benchsuite)
+    target_compile_definitions(context-fabric PRIVATE CONTEXT_FABRIC_BUILD_BENCHMARKS=1)
+  endif()
   target_link_libraries(context-fabric PRIVATE context_fabric)
   context_fabric_enable_warnings(context-fabric)
 endif()

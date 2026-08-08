@@ -11,6 +11,7 @@
 #include "context_fabric/authority/coordinator.h"
 #include "context_fabric/core/prng.h"
 #include "context_fabric/runtime/node_runtime.h"
+#include "example_util.h"
 
 using namespace ctf;
 
@@ -74,10 +75,10 @@ int main(int argc, char** argv) {
     md.compatibility_fingerprint = md.compute_compatibility_fingerprint();
 
     auto content = generate_content(2, 2, md.byte_size);
-    ObjectId id = cf.create_object(md, a, content);
+    ObjectId id = create_object_wait_registered(cf, md, a, content);
     std::printf("created %s on node-a\n", id.to_hex().c_str());
 
-    cf.replicate(id, b);
+    replicate_wait_registered(cf, id, b);
     std::printf("replicated to node-b\n");
 
     auto ir = cf.inspect(id);

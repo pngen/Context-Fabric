@@ -35,3 +35,7 @@ crash.dmp
 # Local scratch
 asan_t.*
 dbg_*
+
+# Runtime artifacts
+coordinator.store
+*.store

@@ -73,7 +73,10 @@ ProcessHandle spawn_process(const std::string& exe, const std::vector<std::strin
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
     std::string cdir = workdir.empty() ? std::string() : workdir;
-    BOOL ok = CreateProcessA(exe.c_str(), &cmdline[0], nullptr, nullptr, TRUE, 0, nullptr,
+    // CREATE_NO_WINDOW keeps spawned coordinator/node processes from popping
+    // their own console windows when the parent is itself a console app.
+    DWORD flags = CREATE_NO_WINDOW;
+    BOOL ok = CreateProcessA(exe.c_str(), &cmdline[0], nullptr, nullptr, TRUE, flags, nullptr,
                              cdir.empty() ? nullptr : cdir.c_str(), &si, &pi);
     if (have_log) CloseHandle(log_handle);
     if (!ok) {
