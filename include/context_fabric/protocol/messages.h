@@ -365,6 +365,7 @@ struct InstructRecvReq {
     uint64_t sha = 0;
     uint32_t role = 0;      // CopyRole at destination
     uint32_t domain = 0;    // StorageDomain at destination
+    uint8_t self_load = 0;  // 1 = load from the node's own persistent store
     ContextMetadata metadata;
 };
 struct InstructAbortReq {

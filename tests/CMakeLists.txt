@@ -10,6 +10,9 @@ add_executable(context_fabric_tests
   test_authority.cpp
   test_fabric_integration.cpp
 )
+if(CONTEXT_FABRIC_HAS_CUDA)
+  target_sources(context_fabric_tests PRIVATE test_cuda.cpp)
+endif()
 target_include_directories(context_fabric_tests PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(context_fabric_tests PRIVATE context_fabric)
 context_fabric_enable_warnings(context_fabric_tests)

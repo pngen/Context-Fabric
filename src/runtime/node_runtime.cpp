@@ -389,7 +389,7 @@ void NodeRuntime::handle_instruct_recv(const InstructRecvReq& instr) {
         do_self_persist(instr);
         return;
     }
-    if (instr.source_node == cfg_.node_id.value()) {
+    if (instr.self_load != 0) {
         do_self_restore(instr);
         return;
     }
@@ -645,7 +645,7 @@ void NodeRuntime::do_recv(Socket sock) {
     try {
         if (domain == StorageDomain::AcceleratorLocal) {
             ContextMetadata md = instr.metadata;
-            objects_.store(instr.object_id, instr.generation, CopyRole::Transient, StorageDomain::HostMemory, &md,
+            objects_.store(instr.object_id, instr.generation, CopyRole::Replica, StorageDomain::HostMemory, &md,
                            buffer.data(), buffer.size());
             if (accelerator_) {
                 uint8_t* device = nullptr;
@@ -653,7 +653,10 @@ void NodeRuntime::do_recv(Socket sock) {
                 accelerator_->copy_h2d(device, buffer.data(), buffer.size());
                 accelerator_->synchronize();
                 accelerator_->verify(device, buffer.size(), received.crc32c, received.sha);
-                accelerator_->free(device);
+                objects_.retain_accelerator(instr.object_id, instr.generation,
+                                            role == CopyRole::Authoritative ? CopyRole::Authoritative
+                                                                             : CopyRole::Replica,
+                                            device, buffer.size());
             }
         } else if (domain == StorageDomain::LocalPersistent && role == CopyRole::Persistent) {
             ContextMetadata md = instr.metadata;

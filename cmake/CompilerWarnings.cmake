@@ -8,13 +8,13 @@ set(_CF_WARN_TARGETS "")
 
 function(context_fabric_enable_warnings target)
   if(MSVC)
-    target_compile_options(${target} PRIVATE /W4 /permissive-)
+    target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive->)
     if(CONTEXT_FABRIC_WARNINGS_AS_ERRORS)
-      target_compile_options(${target} PRIVATE /WX)
+      target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/WX>)
     endif()
     # Disable a small, well-understood set of third-party/toolchain noise that
     # is not produced by project-owned code.
-    target_compile_options(${target} PRIVATE /wd4819)
+    target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/wd4819>)
   else()
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
     if(CONTEXT_FABRIC_WARNINGS_AS_ERRORS)

@@ -28,6 +28,12 @@ struct LocalCopy {
     IntegrityId integrity;
 };
 
+// A resident accelerator allocation (device pointer + size).
+struct AccelResidency {
+    uint8_t* device = nullptr;
+    uint64_t size = 0;
+};
+
 class NodeObjectStore {
 public:
     NodeObjectStore() = default;
@@ -39,6 +45,10 @@ public:
     // Store bytes into the given domain and record the copy role.
     void store(const ObjectId& id, const Generation& gen, CopyRole role, StorageDomain domain,
                const ContextMetadata* metadata, const uint8_t* data, uint64_t size);
+
+    // Retain a device allocation as an accelerator-resident copy.
+    void retain_accelerator(const ObjectId& id, const Generation& gen, CopyRole role,
+                            uint8_t* device, uint64_t size);
 
     // Read bytes for a transfer from whatever backend holds the copy.
     std::vector<uint8_t> read(const ObjectId& id, const Generation& gen) const;
@@ -63,6 +73,7 @@ public:
 private:
     mutable std::mutex mutex_;
     std::unordered_map<CopyKey, LocalCopy> copies_;
+    std::unordered_map<CopyKey, AccelResidency> accelerator_resident_;
     HostMemoryBackend* host_ = nullptr;
     LocalPersistentBackend* persistent_ = nullptr;
     AcceleratorBackend* accelerator_ = nullptr;

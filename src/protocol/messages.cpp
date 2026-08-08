@@ -717,6 +717,7 @@ void serialize_instruct_recv(Writer& w, const InstructRecvReq& r) {
     w.u64(r.sha);
     w.u32(r.role);
     w.u32(r.domain);
+    w.u8(r.self_load);
     std::vector<uint8_t> md;
     r.metadata.serialize(md);
     w.bytes(md.data(), md.size());
@@ -734,6 +735,7 @@ InstructRecvReq deserialize_instruct_recv(Reader& r) {
     m.sha = r.u64();
     m.role = r.u32();
     m.domain = r.u32();
+    m.self_load = r.u8();
     std::vector<uint8_t> md = r.bytes(r.u32());
     m.metadata.deserialize(md.data(), md.size());
     return m;

@@ -45,6 +45,9 @@ add_library(context_fabric_storage STATIC
 target_include_directories(context_fabric_storage PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(context_fabric_storage PUBLIC context_fabric_core)
 context_fabric_enable_warnings(context_fabric_storage)
+if(CONTEXT_FABRIC_HAS_CUDA)
+  target_compile_definitions(context_fabric_storage PUBLIC CONTEXT_FABRIC_HAS_CUDA=1)
+endif()
 
 # ---------------------------------------------------------------------------
 # placement
@@ -86,10 +89,16 @@ if(CONTEXT_FABRIC_HAS_CUDA)
     backends/cuda/cuda_kernels.cu
   )
   target_include_directories(context_fabric_cuda PUBLIC ${PROJECT_SOURCE_DIR}/include)
-  target_link_libraries(context_fabric_cuda PUBLIC context_fabric_core)
+  target_include_directories(context_fabric_cuda PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(context_fabric_cuda PUBLIC context_fabric_core ${CUDAToolkit_LIBRARIES})
   context_fabric_enable_warnings(context_fabric_cuda)
   context_fabric_enable_cuda_warnings(context_fabric_cuda)
   target_compile_definitions(context_fabric_cuda PUBLIC CONTEXT_FABRIC_HAS_CUDA=1)
+  if(MSVC)
+    # nvcc does not tolerate MSVC's /FS (edit-and-continue) PDB flag.
+    # Set the per-target debug format to Embedded (/Z7) which avoids /FS.
+    set_property(TARGET context_fabric_cuda PROPERTY MSVC_DEBUG_INFORMATION_FORMAT Embedded)
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------

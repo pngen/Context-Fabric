@@ -53,13 +53,28 @@ std::vector<uint8_t> NodeObjectStore::read(const ObjectId& id, const Generation&
         case StorageDomain::LocalPersistent:
             if (!persistent_) break;
             return persistent_->get(id, gen);
-        case StorageDomain::AcceleratorLocal:
+        case StorageDomain::AcceleratorLocal: {
             if (!accelerator_) break;
-            throw_error(ErrKind::NotSupported, "accelerator reads require explicit staging");
+            auto ar = accelerator_resident_.find(CopyKey{id, gen});
+            if (ar == accelerator_resident_.end()) throw_error(ErrKind::NotFound, "accelerator copy not resident");
+            std::vector<uint8_t> host(static_cast<size_t>(ar->second.size));
+            accelerator_->copy_d2h(host.data(), ar->second.device, ar->second.size);
+            accelerator_->synchronize();
+            return host;
+        }
         default:
             break;
     }
     throw_error(ErrKind::NotFound, "copy domain unavailable");
+}
+
+void NodeObjectStore::retain_accelerator(const ObjectId& id, const Generation& gen, CopyRole role,
+                                         uint8_t* device, uint64_t size) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    accelerator_resident_[CopyKey{id, gen}] = AccelResidency{device, size};
+    LocalCopy& c = copies_[CopyKey{id, gen}];
+    c.role = role;
+    c.domain = StorageDomain::AcceleratorLocal;
 }
 
 void NodeObjectStore::verify(const ObjectId& id, const Generation& gen, uint64_t expected_crc,
@@ -81,8 +96,14 @@ void NodeObjectStore::verify(const ObjectId& id, const Generation& gen, uint64_t
         case StorageDomain::LocalPersistent:
             bytes = persistent_->get(id, gen);
             break;
-        case StorageDomain::AcceleratorLocal:
-            throw_error(ErrKind::NotSupported, "deep accelerator verification requires explicit staging");
+        case StorageDomain::AcceleratorLocal: {
+            auto ar = accelerator_resident_.find(CopyKey{id, gen});
+            if (ar == accelerator_resident_.end()) throw_error(ErrKind::NotFound, "accelerator copy not resident");
+            bytes.resize(static_cast<size_t>(ar->second.size));
+            accelerator_->copy_d2h(bytes.data(), ar->second.device, ar->second.size);
+            accelerator_->synchronize();
+            break;
+        }
         default:
             throw_error(ErrKind::NotFound, "copy domain unavailable");
     }
@@ -111,8 +132,14 @@ void NodeObjectStore::remove(const ObjectId& id, const Generation& gen) {
         case StorageDomain::LocalPersistent:
             if (persistent_) persistent_->remove(id, gen);
             break;
-        case StorageDomain::AcceleratorLocal:
+        case StorageDomain::AcceleratorLocal: {
+            auto ar = accelerator_resident_.find(CopyKey{id, gen});
+            if (ar != accelerator_resident_.end() && accelerator_) {
+                accelerator_->free(ar->second.device);
+            }
+            accelerator_resident_.erase(CopyKey{id, gen});
             break;
+        }
         default:
             break;
     }

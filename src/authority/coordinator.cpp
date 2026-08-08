@@ -33,6 +33,7 @@ struct Coordinator::PendingOp {
     Generation generation;
     std::string kind;  // create/replicate/migrate/persist/restore/write/verify
     uint64_t target_node = 0;
+    uint64_t source_node = 0;  // data-plane source (0 = client upload / self)
     StorageDomain target_domain = StorageDomain::HostMemory;
     bool keep_source = false;
     uint64_t on_node = 0;
@@ -1232,6 +1233,9 @@ void Coordinator::handle_data_result(const std::shared_ptr<Conn>& conn, uint64_t
         bool commit_ready;
         if (op->kind == "persist" || op->kind == "create" || op->kind == "write") {
             commit_ready = op->receiver_done != 0;
+        } else if (op->kind == "migrate" && op->source_node == op->target_node) {
+            // Same-node domain migration: the single participant reports once.
+            commit_ready = op->receiver_done != 0;
         } else {
             commit_ready = op->receiver_done != 0 && (op->sender_done != 0 || op->kind == "replicate");
         }
@@ -1473,8 +1477,8 @@ std::vector<uint8_t> Coordinator::orchestrate_transfer(const std::string& kind, 
             o.active_op_target = target_node;
             o.active_op_domain = StorageDomain::HostMemory;
         } else if (kind == "migrate") {
-            if (target_node == o.authoritative_node) {
-                throw_error(ErrKind::InvalidArgument, "cannot migrate to the current authoritative node");
+            if (target_node == o.authoritative_node && target_domain == o.authoritative_domain) {
+                throw_error(ErrKind::InvalidArgument, "cannot migrate to the current authoritative location");
             }
             if (!node_online(target_node)) throw_error(ErrKind::NotFound, "target node not online");
             const CoordNode* t = find_node(target_node);
@@ -1570,6 +1574,7 @@ std::vector<uint8_t> Coordinator::orchestrate_transfer(const std::string& kind, 
     op->generation = gen;
     op->kind = kind;
     op->target_node = target_node;
+    op->source_node = source_node;
     op->target_domain = target_domain;
     op->keep_source = keep_source;
     op->on_node = on_node;
@@ -1607,6 +1612,7 @@ std::vector<uint8_t> Coordinator::orchestrate_transfer(const std::string& kind, 
             ir.sha = sha;
             ir.role = static_cast<uint32_t>(CopyRole::Authoritative);
             ir.domain = static_cast<uint32_t>(StorageDomain::HostMemory);
+            ir.self_load = 1;
             ir.metadata = meta;
             Writer w;
             serialize_instruct_recv(w, ir);
@@ -1695,7 +1701,9 @@ std::vector<uint8_t> Coordinator::orchestrate_transfer(const std::string& kind, 
 
     // Post-commit disposal: for migration, the old authoritative node must not
     // delete its copy until the coordinator has committed, so it is told now.
-    if (kind == "migrate") {
+    // Same-node domain migration (e.g. host -> accelerator) has no separate
+    // source process to dispose; the destination already staged the copy.
+    if (kind == "migrate" && source_node != target_node) {
         InstructDisposeReq dr;
         dr.op_token = op_token;
         dr.object_id = object_id;
