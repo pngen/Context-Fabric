@@ -23,9 +23,9 @@ namespace ctf {
 // IMPORTANT:
 //  - Context Fabric builds and runs completely WITHOUT FlashTier.
 //  - No FlashTier source is copied here.
-//  - This header documents and implements the CONTRACT. A concrete adapter
-//    that links against a FlashTier library may be supplied externally via
-//    CONTEXT_FABRIC_FLASHTIER_DIR.
+//  - This header documents the proposed contract boundary. This repository
+//    does not currently wire or load a concrete FlashTier implementation;
+//    configuring CONTEXT_FABRIC_ENABLE_FLASHTIER=ON fails explicitly.
 //  - When no adapter is present, the node's own HostMemoryBackend /
 //    LocalPersistentBackend / CudaAcceleratorBackend are used, exactly as in
 //    the CPU-only and CUDA validation runs.
@@ -67,9 +67,8 @@ public:
     [[nodiscard]] virtual uint64_t high_water_bytes() const noexcept = 0;
 };
 
-// Optional factory. Returns nullptr when no FlashTier adapter is linked.
-// The CLI/runtime wires this in only when CONTEXT_FABRIC_FLASHTIER_DIR is
-// configured at build time.
+// Boundary-only factory. The repository implementation returns nullptr; no
+// CLI/runtime integration invokes it yet.
 FlashTierResidency* create_flashtier_adapter();
 
 }  // namespace ctf

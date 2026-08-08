@@ -148,6 +148,40 @@ CF_TEST(tcp_timeout_handled) {
     server.join();
 }
 
+CF_TEST(tcp_resolution_respects_supported_deadlines) {
+    Socket listener;
+    uint16_t port = 0;
+    CF_REQUIRE(listener.listen("127.0.0.1", 0, port));
+    std::thread server([&] {
+        Socket accepted = listener.accept(3000);
+        if (accepted.valid()) accepted.close();
+        listener.close();
+    });
+
+    Socket hostname_client;
+    auto started = std::chrono::steady_clock::now();
+    bool connected = hostname_client.connect("localhost", port, 2000);
+    auto hostname_elapsed = std::chrono::steady_clock::now() - started;
+    if (connected) hostname_client.close();
+    server.join();
+    CF_CHECK(connected);
+    CF_CHECK(hostname_elapsed < std::chrono::milliseconds(2500));
+
+    Socket zero_budget;
+    started = std::chrono::steady_clock::now();
+    CF_CHECK(!zero_budget.connect("127.0.0.1", port, 0));
+    CF_CHECK(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(100));
+
+#if defined(_WIN32)
+    // Windows GetAddrInfoExW accepts the caller's resolver deadline. `.invalid`
+    // is reserved for negative tests and cannot resolve successfully.
+    Socket missing_host;
+    started = std::chrono::steady_clock::now();
+    CF_CHECK(!missing_host.connect("context-fabric-resolution-test.invalid", 1, 250));
+    CF_CHECK(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(1500));
+#endif
+}
+
 CF_TEST(send_frame_recv_frame_roundtrip) {
     Socket listener;
     uint16_t port = 0;

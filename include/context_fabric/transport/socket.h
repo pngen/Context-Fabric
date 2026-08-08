@@ -1,8 +1,9 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
-#include <string>
 #include <memory>
+#include <string>
 
 namespace ctf {
 
@@ -28,8 +29,11 @@ public:
 
     [[nodiscard]] bool valid() const noexcept { return fd_ != kInvalid; }
 
-    // Connect to host:port, blocking, bounded by `timeout_ms`.
-    // Returns false on failure (peer refused, timeout, DNS failure).
+    // Connect to host:port. Numeric IPv4 resolution and every socket attempt
+    // share `timeout_ms`; Windows hostname resolution uses the same deadline.
+    // POSIX hostname resolution inherits the system resolver's own deadline
+    // because getaddrinfo has no portable cancellation API. Returns false on
+    // failure (peer refused, timeout, DNS failure).
     bool connect(const std::string& host, uint16_t port, uint64_t timeout_ms);
 
     // Bind+listen on host:port (port 0 = ephemeral). On success sets

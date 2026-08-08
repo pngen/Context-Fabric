@@ -162,7 +162,7 @@ struct Location {
 struct IntegrityId {
     uint64_t crc32c = 0;   // streaming/fast checksum
     uint64_t sha = 0;      // first 8 bytes of SHA-256 (strong fingerprint)
-    uint32_t bytes = 0;    // number of bytes hashed
+    uint64_t bytes = 0;    // number of bytes hashed
 
     [[nodiscard]] bool operator==(const IntegrityId&) const noexcept = default;
 };

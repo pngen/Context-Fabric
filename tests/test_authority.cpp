@@ -18,8 +18,8 @@ namespace {
 
 struct TestCoordinator {
     std::string store_path;
-    Coordinator coord;
     Telemetry telemetry;
+    Coordinator coord;
 
     TestCoordinator() : store_path(make_store()), coord(make_cfg(store_path), telemetry) {
         telemetry.set_stderr_enabled(false);
@@ -57,7 +57,7 @@ struct TestNode {
     NodeRuntime node;
 
     TestNode(const std::string& name, uint16_t coord_port, uint64_t host_cap, bool persistent)
-        : root(make_root(name)), node(make_cfg(name, coord_port, host_cap, persistent), telemetry) {
+        : root(make_root(name)), node(make_cfg(name, coord_port, host_cap, persistent, root), telemetry) {
         telemetry.set_stderr_enabled(false);
         if (!node.start()) throw CfError(ErrKind::Internal, "node start failed");
     }
@@ -73,7 +73,7 @@ struct TestNode {
         return r;
     }
     static NodeConfig make_cfg(const std::string& name, uint16_t coord_port, uint64_t host_cap,
-                               bool persistent) {
+                               bool persistent, const std::string& root) {
         NodeConfig cfg;
         cfg.node_id = NodeId::deterministic(name);
         cfg.label = name;
@@ -81,7 +81,7 @@ struct TestNode {
         cfg.coord_port = coord_port;
         cfg.host_capacity = host_cap;
         if (persistent) {
-            cfg.store_root = make_root(name + "-store");
+            cfg.store_root = root;
             cfg.persistent_capacity = 256ull * 1024 * 1024;
         }
         cfg.heartbeat_interval_ms = 500;
@@ -199,6 +199,12 @@ CF_TEST(authority_three_node_fabric_roundtrip) {
     cf.remove(id);
     auto ir_after = cf.inspect(id);
     CF_CHECK(ir_after.has == 0);
+    CF_CHECK(wait_until([&] {
+        return !na.node.objects().has_copy(id, Generation::first()) &&
+               !nb.node.objects().has_copy(id, Generation::first()) &&
+               !nc.node.objects().has_copy(id, Generation::first());
+    }, 5000));
+    CF_CHECK(!nc.node.persistent()->contains(id, Generation::first()));
 }
 
 CF_TEST(authority_leases_conflict_and_stale) {
@@ -243,14 +249,19 @@ CF_TEST(authority_write_generation_advances) {
     TestCoordinator tc;
     TestNode na("node-a", tc.port(), 64ull * 1024 * 1024, false);
     TestNode nb("node-b", tc.port(), 64ull * 1024 * 1024, false);
-    CF_REQUIRE(wait_until([&] { return tc.coord.online_node_count() == 2; }, 10000));
+    TestNode nc("node-c", tc.port(), 64ull * 1024 * 1024, true);
+    CF_REQUIRE(wait_until([&] { return tc.coord.online_node_count() == 3; }, 10000));
 
     ContextFabric cf;
     CF_REQUIRE(cf.connect("127.0.0.1", tc.port(), 5000));
     uint64_t node_a = NodeId::deterministic("node-a").value();
+    uint64_t node_b = NodeId::deterministic("node-b").value();
+    uint64_t node_c = NodeId::deterministic("node-c").value();
 
     auto md = md_with(4096);
     ObjectId id = cf.create_object(md, node_a, generate_content(1, 1, 4096));
+    CF_CHECK(cf.replicate(id, node_b).node_id == node_b);
+    CF_CHECK(cf.persist(id, node_c) == node_c);
 
     Lease wl = cf.acquire_write_lease(id, node_a, 10000);
     auto new_content = generate_content(2, 2, 8192);
@@ -262,6 +273,13 @@ CF_TEST(authority_write_generation_advances) {
     auto vr = cf.verify(id, node_a, true);
     CF_CHECK(vr.ok);
     CF_CHECK(vr.bytes == new_content.size());
+    CF_CHECK(wait_until([&] {
+        return !na.node.objects().has_copy(id, Generation::first()) &&
+               !nb.node.objects().has_copy(id, Generation::first()) &&
+               !nc.node.objects().has_copy(id, Generation::first());
+    }, 5000));
+    CF_CHECK(na.node.objects().has_copy(id, g2));
+    CF_CHECK(!nc.node.persistent()->contains(id, Generation::first()));
 
     // Writing with a wrong expected generation is rejected (conflict).
     CF_CHECK_THROWS(cf.write_generation(id, wl, generate_content(3, 3, 100)), ErrKind::Conflict);
@@ -269,6 +287,42 @@ CF_TEST(authority_write_generation_advances) {
     Lease bogus = wl;
     bogus.lease_id = wl.lease_id + 999;
     CF_CHECK_THROWS(cf.write_generation(id, bogus, generate_content(3, 3, 100)), ErrKind::StaleLease);
+}
+
+CF_TEST(authority_lifetime_expiry_revokes_authority_and_disposes_reachable_copies) {
+    TestCoordinator tc;
+    TestNode na("expiry-a", tc.port(), 64ull * 1024 * 1024, false);
+    TestNode nb("expiry-b", tc.port(), 64ull * 1024 * 1024, false);
+    TestNode nc("expiry-c", tc.port(), 64ull * 1024 * 1024, true);
+    CF_REQUIRE(wait_until([&] { return tc.coord.online_node_count() == 3; }, 10000));
+
+    ContextFabric cf;
+    CF_REQUIRE(cf.connect("127.0.0.1", tc.port(), 5000));
+    const uint64_t node_a = NodeId::deterministic("expiry-a").value();
+    const uint64_t node_b = NodeId::deterministic("expiry-b").value();
+    const uint64_t node_c = NodeId::deterministic("expiry-c").value();
+    ContextMetadata md = md_with(4096);
+    md.lifetime_seconds = 2;
+    const ObjectId id = cf.create_object(md, node_a, generate_content(21, 22, 4096));
+    CF_CHECK(cf.replicate(id, node_b).node_id == node_b);
+    CF_CHECK(cf.persist(id, node_c) == node_c);
+
+    CF_REQUIRE(wait_until([&] {
+        return cf.inspect(id).lifecycle == static_cast<uint32_t>(LifecycleState::Expired);
+    }, 7000));
+    const auto expired = cf.inspect(id);
+    CF_CHECK(expired.authoritative_node == 0);
+    CF_CHECK(expired.authoritative_generation == 0);
+    CF_CHECK(expired.authoritative_domain == static_cast<uint32_t>(StorageDomain::Unknown));
+    CF_CHECK(expired.replica_nodes.empty());
+    CF_CHECK(expired.persistent_nodes.empty());
+    CF_CHECK_THROWS(cf.acquire_read_lease(id, node_a, 1000), ErrKind::State);
+    CF_CHECK(wait_until([&] {
+        return !na.node.objects().has_copy(id, Generation::first()) &&
+               !nb.node.objects().has_copy(id, Generation::first()) &&
+               !nc.node.objects().has_copy(id, Generation::first());
+    }, 5000));
+    CF_CHECK(!nc.node.persistent()->contains(id, Generation::first()));
 }
 
 CF_TEST(authority_retry_idempotent) {

@@ -1,6 +1,7 @@
 #include "test_harness.h"
 
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -10,9 +11,11 @@
 #include "context_fabric/core/serializer.h"
 #include "context_fabric/core/state_machine.h"
 #include "context_fabric/core/integrity.h"
+#include "context_fabric/core/json.h"
 #include "context_fabric/core/prng.h"
 #include "context_fabric/core/clock.h"
 #include "context_fabric/core/lineage.h"
+#include "context_fabric/core/node.h"
 
 using namespace ctf;
 
@@ -31,6 +34,11 @@ CF_TEST(object_id_deterministic_and_stable) {
     CF_CHECK(e == a);
     // Hashable + comparable.
     CF_CHECK(a < c || c < a);
+}
+
+CF_TEST(object_id_deterministic_components_are_unambiguous) {
+    CF_CHECK(ObjectId::deterministic("a@b", "c") != ObjectId::deterministic("a", "b@c"));
+    CF_CHECK(ObjectId::deterministic("", "a@b") != ObjectId::deterministic("@a", "b"));
 }
 
 CF_TEST(object_id_random_unique) {
@@ -56,6 +64,11 @@ CF_TEST(generation_advances) {
     Generation h = Generation::from_hex("0000000000000002");
     CF_CHECK(h == g2);
     CF_CHECK(Generation::from_hex(g2.to_hex()) == g2);
+}
+
+CF_TEST(generation_rejects_invalid_advance_and_overflow) {
+    CF_CHECK_THROWS(Generation().next(), ErrKind::State);
+    CF_CHECK_THROWS(Generation::from_hex("ffffffffffffffff").next(), ErrKind::Capacity);
 }
 
 CF_TEST(metadata_compatibility_strict) {
@@ -92,6 +105,13 @@ CF_TEST(metadata_compatibility_strict) {
     m6.tags = {"x"};
     m6.compatibility_fingerprint = m6.compute_compatibility_fingerprint();
     CF_CHECK(!m1.compatible_with(m6));
+
+    // A caller-supplied/stale matching fingerprint is never sufficient to
+    // bypass descriptor comparison.
+    ContextMetadata forged = m1;
+    forged.model_revision = "forged";
+    CF_CHECK(forged.compatibility_fingerprint == m1.compatibility_fingerprint);
+    CF_CHECK(!m1.compatible_with(forged));
 }
 
 CF_TEST(metadata_serialization_roundtrip) {
@@ -136,6 +156,31 @@ CF_TEST(metadata_serialization_roundtrip) {
     CF_CHECK(out.compatible_with(md));
 }
 
+CF_TEST(metadata_deserialization_fails_closed) {
+    ContextMetadata md;
+    md.namespace_id = "ns";
+    md.model_id = "model";
+    md.compatibility_fingerprint = md.compute_compatibility_fingerprint();
+    std::vector<uint8_t> bytes;
+    md.serialize(bytes);
+
+    auto forged_fingerprint = bytes;
+    forged_fingerprint.back() ^= 1;
+    ContextMetadata out;
+    CF_CHECK_THROWS(out.deserialize(forged_fingerprint.data(), forged_fingerprint.size()), ErrKind::Protocol);
+
+    auto invalid_enum = bytes;
+    invalid_enum[0] = 0xff;
+    invalid_enum[1] = 0xff;
+    invalid_enum[2] = 0xff;
+    invalid_enum[3] = 0xff;
+    CF_CHECK_THROWS(out.deserialize(invalid_enum.data(), invalid_enum.size()), ErrKind::Protocol);
+
+    auto trailing = bytes;
+    trailing.push_back(0);
+    CF_CHECK_THROWS(out.deserialize(trailing.data(), trailing.size()), ErrKind::Protocol);
+}
+
 CF_TEST(serializer_bounds_checks) {
     Writer w;
     w.u32(1);
@@ -152,6 +197,32 @@ CF_TEST(serializer_bounds_checks) {
     std::vector<uint8_t> bad = {0, 0, 0, 255};  // claims 255-byte string
     Reader r2(bad.data(), bad.size());
     CF_CHECK_THROWS(r2.str(), ErrKind::Protocol);
+}
+
+CF_TEST(serializer_null_zero_is_safe_and_nonzero_is_rejected) {
+    Reader empty(nullptr, 0);
+    CF_CHECK(empty.at_end());
+    CF_CHECK_NOTHROW(empty.bytes(nullptr, 0));
+    CF_CHECK_THROWS(Reader(nullptr, 1), ErrKind::Protocol);
+
+    Writer writer;
+    CF_CHECK_NOTHROW(writer.append(nullptr, 0));
+    CF_CHECK_NOTHROW(writer.bytes(nullptr, 0));
+    CF_CHECK_THROWS(writer.append(nullptr, 1), ErrKind::InvalidArgument);
+}
+
+CF_TEST(json_writer_preserves_valid_utf8_and_escapes_invalid_bytes) {
+    const std::string valid = "caf\xC3\xA9";
+    CF_CHECK(json_escape_string(valid) == std::string("\"") + valid + "\"");
+
+    const std::string invalid(1, static_cast<char>(0xFF));
+    CF_CHECK(json_escape_string(invalid) == "\"\\u00ff\"");
+
+    JsonObject object;
+    object.field("bad\xFF", invalid).field("finite", 1.25).field("nan", std::numeric_limits<double>::quiet_NaN());
+    std::string encoded;
+    object.write_to(encoded);
+    CF_CHECK(encoded == "{\"bad\\u00ff\":\"\\u00ff\",\"finite\":1.250000,\"nan\":null}");
 }
 
 CF_TEST(state_machine_legal_and_illegal) {
@@ -209,6 +280,10 @@ CF_TEST(integrity_crc_and_sha) {
                                   0xde, 0x5d, 0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17,
                                   0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad};
     CF_CHECK(std::memcmp(d.data(), expected, 32) == 0);
+
+    // Standard CRC-32C/Castagnoli known-answer vector.
+    const char* digits = "123456789";
+    CF_CHECK(Crc32C::compute(digits, 9) == 0xE3069283u);
 }
 
 CF_TEST(prng_deterministic) {
@@ -222,6 +297,12 @@ CF_TEST(prng_deterministic) {
     Prng p1(1234);
     Prng p2(1234);
     for (int i = 0; i < 1000; ++i) CF_CHECK(p1.next_u64() == p2.next_u64());
+
+    const std::vector<uint8_t> known = generate_content(1, 2, 8);
+    const uint8_t expected[8] = {0xc0, 0x8c, 0x66, 0xe5, 0xda, 0xab, 0xcd, 0xb0};
+    CF_CHECK(std::memcmp(known.data(), expected, sizeof(expected)) == 0);
+    CF_CHECK_THROWS(fill_deterministic(1, 0, nullptr, 1), ErrKind::InvalidArgument);
+    CF_CHECK_NOTHROW(fill_deterministic(1, 0, nullptr, 0));
 }
 
 CF_TEST(byte_size_parsing) {
@@ -236,6 +317,20 @@ CF_TEST(byte_size_parsing) {
     CF_CHECK(!parse_byte_size("abc", v));
     CF_CHECK(!parse_byte_size("1XB", v));
     CF_CHECK(!parse_byte_size("1MiGISBH", v));
+    CF_CHECK(!parse_byte_size("1.5", v));
+    CF_CHECK(!parse_byte_size("1.", v));
+    CF_CHECK(!parse_byte_size("1MiB-junk", v));
+}
+
+CF_TEST(node_address_formatting_is_not_truncated) {
+    NodeAddress address;
+    address.host = std::string(240, 'a') + ".example";
+    address.port = 65535;
+    CF_CHECK(address.to_string() == address.host + ":65535");
+
+    address.host = "2001:db8::1";
+    address.port = 80;
+    CF_CHECK(address.to_string() == "[2001:db8::1]:80");
 }
 
 CF_TEST(lineage_roundtrip) {

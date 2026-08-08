@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "context_fabric/core/node.h"
@@ -134,14 +135,17 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<uint16_t> data_port_{0};
     std::atomic<uint64_t> epoch_{0};
-    uint64_t session_id_ = 0;
-    uint64_t session_epoch_ = 0;
+    std::atomic<uint64_t> session_id_{0};
+    std::atomic<uint64_t> session_epoch_{0};
 
     Socket ctrl_sock_;
+    std::mutex ctrl_socket_lifecycle_mutex_;
     std::mutex ctrl_send_mutex_;
     std::atomic<uint64_t> req_seq_{1};
 
     Socket listener_;
+    std::mutex active_socket_mutex_;
+    std::unordered_set<Socket*> active_sockets_;
     std::thread control_thread_;
     std::thread heartbeat_thread_;
     std::thread accept_thread_;
@@ -150,11 +154,12 @@ private:
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::deque<Job> queue_;
-    size_t queue_size_ = 0;
 
     std::mutex mutex_;
+    std::condition_variable pending_cv_;
     std::unordered_map<uint64_t, PendingRecv> pending_recv_;
 
+    std::mutex lifecycle_mutex_;
     std::mutex shutdown_mutex_;
     std::condition_variable shutdown_cv_;
 

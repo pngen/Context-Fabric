@@ -2,6 +2,7 @@
 // bytes at the destination.
 
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <memory>
 
@@ -14,12 +15,14 @@
 using namespace ctf;
 
 int main() {
+    try {
+    ExampleTempDirectory workspace("migrate");
     Telemetry coord_t;
     coord_t.set_stderr_enabled(false);
     Coordinator::Config cc;
     cc.bind_host = "127.0.0.1";
     cc.control_port = 0;
-    cc.store_path = (std::filesystem::temp_directory_path() / "cf-migrate-coord.store").string();
+    cc.store_path = (workspace.path() / "coordinator.store").string();
     cc.telemetry_path = "";
     Coordinator coord(cc, coord_t);
     if (!coord.start()) return 1;
@@ -62,15 +65,23 @@ int main() {
     std::printf("created %s on node-a\n", id.to_hex().c_str());
 
     Location loc;
-    detail::retry_while_registrating(
+    detail::retry_while_registering(
         [&] { loc = cf.migrate(id, b, StorageDomain::HostMemory, false); }, "migration");
     std::printf("migrated to node-b (%s)\n", storage_domain_name(loc.domain));
 
     auto ir = cf.inspect(id);
     std::printf("authoritative now node %llu\n", static_cast<unsigned long long>(ir.authoritative_node));
+    if (ir.authoritative_node != b) {
+        std::fprintf(stderr, "authoritative node did not move to node-b\n");
+        return 1;
+    }
 
     auto vr = cf.verify(id, b, true);
     std::printf("verify at destination: %s (bytes=%llu)\n", vr.ok ? "OK" : "FAIL",
                 static_cast<unsigned long long>(vr.bytes));
     return vr.ok ? 0 : 1;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "example error: %s\n", e.what());
+        return 1;
+    }
 }

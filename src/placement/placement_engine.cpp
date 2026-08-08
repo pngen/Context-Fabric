@@ -1,7 +1,9 @@
 #include "context_fabric/placement/placement_engine.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <limits>
 
 #include "context_fabric/core/error.h"
 
@@ -9,9 +11,26 @@ namespace ctf {
 
 namespace {
 
+bool same_location(const Location& lhs, const Location& rhs) {
+    return lhs.valid() && rhs.valid() && lhs.node_id == rhs.node_id && lhs.domain == rhs.domain;
+}
+
+void validate_candidate_metrics(const PlacementCandidate& c) {
+    const auto valid_metric = [](double value) { return std::isfinite(value) && value >= 0.0; };
+    if (!c.location.valid()) {
+        throw_error(ErrKind::InvalidArgument, "placement candidate location must be valid");
+    }
+    if (!valid_metric(c.bandwidth_bps) || !valid_metric(c.latency_ms) ||
+        !valid_metric(c.storage_bps) || !valid_metric(c.accelerator_bps)) {
+        throw_error(ErrKind::InvalidArgument, "placement metrics must be finite and non-negative");
+    }
+}
+
 // A candidate is capable of hosting the object if its domain is supported by
-// its capabilities and it has headroom for the object's bytes.
-bool candidate_capable(const ContextMetadata& meta, const PlacementCandidate& c) {
+// its capabilities and it has headroom for the object's bytes. An object that
+// is already at the candidate location needs no additional capacity.
+bool candidate_capable(const ContextMetadata& meta, const Location& current,
+                       const PlacementCandidate& c) {
     switch (c.location.domain) {
         case StorageDomain::HostMemory:
             if (!c.caps.host_memory) return false;
@@ -25,13 +44,22 @@ bool candidate_capable(const ContextMetadata& meta, const PlacementCandidate& c)
         default:
             return false;
     }
-    if (c.total_bytes != 0 && c.used_bytes + meta.byte_size > c.total_bytes) return false;
+    if (c.total_bytes != 0) {
+        if (c.used_bytes > c.total_bytes) return false;
+        const uint64_t additional = same_location(current, c.location) ? 0 : meta.byte_size;
+        if (additional > c.total_bytes - c.used_bytes) return false;
+    }
     return true;
 }
 
 double transfer_seconds(const ContextMetadata& meta, const PlacementCandidate& c) {
     if (c.bandwidth_bps <= 0.0) return 1e9;
-    return static_cast<double>(meta.byte_size) / c.bandwidth_bps + c.latency_ms / 1000.0;
+    const double seconds = static_cast<double>(meta.byte_size) / c.bandwidth_bps +
+                           c.latency_ms / 1000.0;
+    if (!std::isfinite(seconds)) {
+        throw_error(ErrKind::InvalidArgument, "placement metrics produce a non-finite transfer time");
+    }
+    return seconds;
 }
 
 }  // namespace
@@ -39,9 +67,14 @@ double transfer_seconds(const ContextMetadata& meta, const PlacementCandidate& c
 PlacementDecision PlacementEngine::decide(const ContextMetadata& meta, const Location& current,
                                           const std::vector<PlacementCandidate>& candidates,
                                           const std::string& policy) const {
+    if (!std::isfinite(meta.reuse_probability) || meta.reuse_probability < 0.0 ||
+        meta.reuse_probability > 1.0) {
+        throw_error(ErrKind::InvalidArgument, "reuse probability must be finite and between zero and one");
+    }
     std::vector<PlacementCandidate> capable;
     for (const auto& c : candidates) {
-        if (candidate_capable(meta, c)) capable.push_back(c);
+        validate_candidate_metrics(c);
+        if (candidate_capable(meta, current, c)) capable.push_back(c);
     }
     if (capable.empty()) {
         throw_error(ErrKind::NotFound, "no candidate can host the object");
@@ -62,25 +95,29 @@ PlacementDecision PlacementEngine::decide_baseline(const ContextMetadata& meta,
     for (const auto& c : candidates) {
         if (current.valid() && c.location.node_id == current.node_id &&
             c.location.domain == current.domain) {
-            best = const_cast<PlacementCandidate*>(&c);
+            best = &c;
             break;
         }
     }
     if (best == nullptr) {
         for (const auto& c : candidates) {
             if (best == nullptr) {
-                best = const_cast<PlacementCandidate*>(&c);
+                best = &c;
                 continue;
             }
-            uint64_t free_best = best->total_bytes > best->used_bytes ? best->total_bytes - best->used_bytes : 0;
-            uint64_t free_c = c.total_bytes > c.used_bytes ? c.total_bytes - c.used_bytes : 0;
+            const uint64_t free_best = best->total_bytes == 0
+                                           ? std::numeric_limits<uint64_t>::max()
+                                           : best->total_bytes - best->used_bytes;
+            const uint64_t free_c = c.total_bytes == 0
+                                        ? std::numeric_limits<uint64_t>::max()
+                                        : c.total_bytes - c.used_bytes;
             if (free_c > free_best) {
-                best = const_cast<PlacementCandidate*>(&c);
+                best = &c;
             } else if (free_c == free_best) {
                 if (c.location.node_id < best->location.node_id ||
                     (c.location.node_id == best->location.node_id &&
                      static_cast<uint32_t>(c.location.domain) < static_cast<uint32_t>(best->location.domain))) {
-                    best = const_cast<PlacementCandidate*>(&c);
+                    best = &c;
                 }
             }
         }
@@ -106,16 +143,18 @@ PlacementDecision PlacementEngine::decide_cost_aware(const ContextMetadata& meta
     const double ref_sec = 1.0;
     const PlacementCandidate* best = nullptr;
     double best_score = 0.0;
+    double best_transfer = 0.0;
     char reason_buf[256];
 
     for (const auto& c : candidates) {
-        bool staying = current.valid() && c.location.node_id == current.node_id &&
-                       c.location.domain == current.domain;
+        const bool staying = same_location(current, c.location);
         double transfer = staying ? 0.0 : transfer_seconds(meta, c);
 
         double pressure = 0.0;
         if (c.total_bytes > 0) {
-            double frac = static_cast<double>(c.used_bytes + meta.byte_size) / static_cast<double>(c.total_bytes);
+            const uint64_t additional = staying ? 0 : meta.byte_size;
+            const double frac = static_cast<double>(c.used_bytes) / static_cast<double>(c.total_bytes) +
+                                static_cast<double>(additional) / static_cast<double>(c.total_bytes);
             if (frac > 0.9) pressure = 10.0;
             else if (frac > 0.7) pressure = 2.0;
         }
@@ -128,32 +167,37 @@ PlacementDecision PlacementEngine::decide_cost_aware(const ContextMetadata& meta
         double score = (transfer / ref_sec) + pressure + reuse_term;
 
         if (staying) score -= 1.0;  // strong preference to avoid gratuitous moves
+        if (!std::isfinite(score)) {
+            throw_error(ErrKind::InvalidArgument, "placement metrics produce a non-finite score");
+        }
 
         if (best == nullptr || score < best_score - 1e-12) {
-            best = const_cast<PlacementCandidate*>(&c);
+            best = &c;
             best_score = score;
+            best_transfer = transfer;
         } else if (score > best_score - 1e-12 && score < best_score + 1e-12) {
             // Stable tie-break.
             if (c.location.node_id < best->location.node_id ||
                 (c.location.node_id == best->location.node_id &&
                  static_cast<uint32_t>(c.location.domain) < static_cast<uint32_t>(best->location.domain))) {
-                best = const_cast<PlacementCandidate*>(&c);
+                best = &c;
                 best_score = score;
+                best_transfer = transfer;
             }
         }
     }
 
     snprintf(reason_buf, sizeof(reason_buf),
              "cost-aware: score=%.4f transfer=%.4fs pressure term and reuse term applied",
-             best_score, transfer_seconds(meta, *best));
+             best_score, best_transfer);
 
     PlacementDecision d;
     d.location = best->location;
     d.policy = kPolicyCostAware;
     d.score = best_score;
     d.reason = reason_buf;
-    d.transfer.expected_seconds = transfer_seconds(meta, *best);
-    d.transfer.expected_bytes = static_cast<double>(meta.byte_size);
+    d.transfer.expected_seconds = best_transfer;
+    d.transfer.expected_bytes = best_transfer == 0.0 ? 0.0 : static_cast<double>(meta.byte_size);
     return d;
 }
 

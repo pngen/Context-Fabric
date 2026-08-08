@@ -6,6 +6,7 @@
 // verified byte-exact.
 
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <memory>
 
@@ -20,10 +21,10 @@ using namespace ctf;
 namespace fs = std::filesystem;
 
 int main() {
-    std::string node_store = (fs::temp_directory_path() / "cf-persist-node").string();
-    std::string coord_store = (fs::temp_directory_path() / "cf-persist-coord.store").string();
-    fs::remove_all(node_store);
-    fs::remove(coord_store);
+    try {
+    ExampleTempDirectory workspace("persistent");
+    std::string node_store = (workspace.path() / "node").string();
+    std::string coord_store = (workspace.path() / "coordinator.store").string();
 
     ObjectId id;
     auto content = generate_content(4, 4, 4ull * 1024 * 1024);
@@ -113,8 +114,10 @@ int main() {
         auto vr = cf.verify(id, n, true);
         std::printf("verify after restore: %s (bytes=%llu)\n", vr.ok ? "OK" : "FAIL",
                     static_cast<unsigned long long>(vr.bytes));
-        fs::remove_all(node_store);
-        fs::remove(coord_store);
         return vr.ok ? 0 : 1;
+    }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "example error: %s\n", e.what());
+        return 1;
     }
 }

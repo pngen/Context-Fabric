@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -15,7 +16,7 @@ namespace ctf {
 // Wire frame.
 //
 //   offset  size  field
-//   0       4     magic (0x41524643 "CFRA")
+//   0       4     magic (0x43465241 "CFRA")
 //   4       2     protocol version
 //   6       2     flags
 //   8       2     message type (see protocol/messages.h)
@@ -50,8 +51,9 @@ struct FrameHeader {
     uint32_t header_crc = 0;
 };
 
-// Validates magic/version/header-checksum of a decoded header. Throws
-// CfError(Protocol) on any violation.
+// Validates the structural fields of a decoded header. The raw header checksum
+// is verified by recv_frame(), where the original bytes are available. Throws
+// CfError(Protocol) on any structural violation.
 void validate_frame_header(const FrameHeader& h);
 
 // Serialize a header into the 40-byte wire form.
@@ -69,6 +71,12 @@ void send_frame(Socket& sock, MessageType type, uint64_t request_id, uint64_t no
 // Receive one complete frame. Returns the header; the payload is placed in
 // `payload`. Handles partial reads. Throws CfError(Protocol) for malformed
 // frames and CfError(Timeout) if the header does not arrive in time.
-FrameHeader recv_frame(Socket& sock, std::vector<uint8_t>& payload, uint64_t timeout_ms);
+// When `running`/`closed` are supplied, an idle stream is polled until a frame
+// starts or cancellation is requested. Once its first byte arrives, the whole
+// frame must complete within `timeout_ms`; partial progress is never discarded.
+FrameHeader recv_frame(Socket& sock, std::vector<uint8_t>& payload, uint64_t timeout_ms,
+                       uint32_t max_payload = kFrameMaxPayload,
+                       const std::atomic<bool>* running = nullptr,
+                       const std::atomic<bool>* closed = nullptr);
 
 }  // namespace ctf

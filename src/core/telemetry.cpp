@@ -24,15 +24,33 @@ void Telemetry::open(const std::string& path) {
 }
 
 void Telemetry::close() {
-    if (!mutex_.try_lock()) {
-        return;
-    }
+    std::lock_guard<std::mutex> lock(mutex_);
     if (file_.is_open()) file_.close();
     opened_ = false;
-    mutex_.unlock();
+}
+
+bool Telemetry::is_open() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return opened_;
+}
+
+void Telemetry::set_node_id(uint64_t node_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    node_id_ = node_id;
+}
+
+void Telemetry::set_coordinator_epoch(uint64_t epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    epoch_ = epoch;
+}
+
+void Telemetry::set_stderr_enabled(bool on) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stderr_enabled_ = on;
 }
 
 void Telemetry::emit(const std::string& event, const JsonObject& doc) {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::string line;
     JsonObject env;
     env.field("schema", static_cast<uint64_t>(kTelemetrySchemaVersion));
@@ -52,7 +70,6 @@ void Telemetry::emit(const std::string& event, const JsonObject& doc) {
     line += doc_str;
     line += "}\n";
 
-    std::lock_guard<std::mutex> lock(mutex_);
     if (file_.is_open()) file_ << line;
     if (stderr_enabled_) std::cerr << line;
 }

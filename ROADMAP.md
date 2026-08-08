@@ -12,7 +12,7 @@ future sections are not current features and are never marketed as such.
   deterministic malformed-frame rejection.
 - Single configured metadata coordinator with durable snapshot commits,
   coordinator epochs, node sessions, and lease epochs/tokens.
-- Read/write leases with expiry, renewal, relinquishment, conflict denial,
+- Read/write leases with expiry, relinquishment, conflict denial,
   stale-lease rejection, and node-disconnect cleanup.
 - Multi-process local fabric: coordinator + N real node processes over
   localhost TCP.
@@ -22,7 +22,8 @@ future sections are not current features and are never marketed as such.
 - Durable versioned persistence with checksums, atomic commit, quarantine.
 - Restore and deterministic recovery (node loss, node restart, coordinator
   restart).
-- Integrity at every important boundary (CRC-32C + SHA-256).
+- Integrity at important boundaries (CRC-32C plus a 64-bit fingerprint derived
+  from SHA-256; this is corruption detection, not authentication).
 - Deterministic placement (baseline + cost-aware) with stable tie-breaking.
 - Transfer-versus-recompute planner with auditable decisions.
 - Host memory, local persistent, and CUDA accelerator backends.

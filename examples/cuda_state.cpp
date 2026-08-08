@@ -5,6 +5,7 @@
 // device is present.
 
 #include <cstdio>
+#include <exception>
 #include <memory>
 
 #include "context_fabric/core/integrity.h"
@@ -19,6 +20,7 @@ int main() {
         std::printf("no CUDA device available; skipping\n");
         return 0;
     }
+    try {
     acc->set_device(0);
     std::printf("device: %s (compute capability %llu.%llu, %llu bytes)\n", acc->device_name(0).c_str(),
                 static_cast<unsigned long long>(acc->device_compute_capability_major(0)),
@@ -31,6 +33,18 @@ int main() {
 
     uint8_t* device = nullptr;
     acc->allocate(device, size);
+    struct DeviceAllocation {
+        AcceleratorBackend* backend;
+        uint8_t*& pointer;
+        ~DeviceAllocation() {
+            if (pointer == nullptr) return;
+            try {
+                backend->free(pointer);
+            } catch (...) {
+            }
+            pointer = nullptr;
+        }
+    } allocation{acc.get(), device};
     if (!device) {
         std::printf("allocation failed\n");
         return 1;
@@ -53,6 +67,15 @@ int main() {
     std::printf("device -> host: byte-exact=%s\n", exact ? "yes" : "NO");
 
     acc->free(device);
+    device = nullptr;
     acc->shutdown();
     return exact ? 0 : 1;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "CUDA example error: %s\n", e.what());
+        try {
+            acc->shutdown();
+        } catch (...) {
+        }
+        return 1;
+    }
 }

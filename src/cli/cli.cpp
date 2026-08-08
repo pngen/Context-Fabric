@@ -1,8 +1,13 @@
 #include "cli.h"
 
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <initializer_list>
+#include <limits>
+#include <string_view>
 #include <thread>
 
 #include "context_fabric/api/context_fabric.h"
@@ -35,8 +40,8 @@ std::string help_text() {
         "  context-fabric node --coordinator HOST:PORT --id NAME [--store DIR]\n"
         "      [--host-cap SIZE] [--persist-cap SIZE] [--accel-cap SIZE] [--cuda]\n"
         "      [--data-port N] [--telemetry FILE] [--label LABEL]\n"
-        "  context-fabric fabric local [--nodes N] [--cuda-node] [--workload NAME]\n"
-        "      [--retain] [--root DIR] [--coord-port N]\n"
+        "  context-fabric fabric local [--nodes N] [--cuda-node] [--workload default]\n"
+        "      [--retain] [--root DIR] [--coord-port N] [--size SIZE] [--quick]\n"
         "  context-fabric object create --coordinator HOST:PORT --namespace NS --name NAME\n"
         "      [--class CLASS] [--size SIZE|--bytes N] [--owner NODE] [--seed N]\n"
         "      [--persistence POLICY] [--sharing POLICY] [--mutable] [--lifetime SEC]\n"
@@ -58,7 +63,7 @@ std::string help_text() {
         "      --size SIZE [--current NODE] [--class CLASS]\n"
         "  context-fabric decide --coordinator HOST:PORT --namespace NS --name NAME --size SIZE\n"
         "      --current NODE --target NODE --recompute-sec X [--bandwidth BPS]\n"
-        "  context-fabric benchmark [--coordinator HOST:PORT] [--suite NAME] [--size SIZE]\n"
+        "  context-fabric benchmark [--quick] [--cuda] [--size SIZE]\n"
         "\n"
         "Sizes accept suffixes: B, KB, MB, GB, TB, KiB, MiB, GiB, TiB.\n";
     return h;
@@ -66,9 +71,56 @@ std::string help_text() {
 
 void print_help() { std::printf("%s", help_text().c_str()); }
 
-uint64_t require_u64(const char* what) {
-    (void)what;
-    return 0;
+bool validate_args(const Args& args, std::initializer_list<std::string_view> values,
+                   std::initializer_list<std::string_view> flags = {}) {
+    auto error = args.validate_remaining(values, flags);
+    if (!error) return true;
+    std::fprintf(stderr, "error: %s\n", error->c_str());
+    return false;
+}
+
+bool parse_u64_option(const Args& args, const char* name, uint64_t& out, uint64_t min_value = 0,
+                      uint64_t max_value = std::numeric_limits<uint64_t>::max()) {
+    auto text = args.value(name);
+    if (!text) return true;
+    auto value = Args::parse_u64(*text);
+    if (!value || *value < min_value || *value > max_value) {
+        std::fprintf(stderr, "error: invalid --%s value '%s'\n", name, text->c_str());
+        return false;
+    }
+    out = *value;
+    return true;
+}
+
+bool parse_u16_option(const Args& args, const char* name, uint16_t& out) {
+    uint64_t value = out;
+    if (!parse_u64_option(args, name, value, 0, 65535)) return false;
+    out = static_cast<uint16_t>(value);
+    return true;
+}
+
+bool parse_node_ref(const std::string& text, uint64_t& out) {
+    if (text.empty()) return false;
+    bool decimal = true;
+    for (char c : text) decimal = decimal && c >= '0' && c <= '9';
+    if (decimal) {
+        auto parsed = Args::parse_u64(text);
+        if (!parsed || *parsed == 0) return false;
+        out = *parsed;
+        return true;
+    }
+    out = NodeId::deterministic(text).value();
+    return out != 0;
+}
+
+std::optional<double> parse_finite_double(const std::string& text) {
+    if (text.empty()) return std::nullopt;
+    double value = 0.0;
+    auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, std::chars_format::general);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || !std::isfinite(value)) {
+        return std::nullopt;
+    }
+    return value;
 }
 
 bool parse_coord(const Args& args, std::string& host, uint16_t& port) {
@@ -83,8 +135,11 @@ bool parse_coord(const Args& args, std::string& host, uint16_t& port) {
         return false;
     }
     host = c->substr(0, colon);
+    if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+        host = host.substr(1, host.size() - 2);
+    }
     auto p = Args::parse_u64(c->substr(colon + 1));
-    if (!p || *p > 65535) {
+    if (host.empty() || !p || *p == 0 || *p > 65535) {
         std::fprintf(stderr, "error: invalid coordinator port\n");
         return false;
     }
@@ -99,8 +154,7 @@ ContextMetadata make_metadata(const Args& args, const std::string& ns, const std
     if (sc) {
         auto parsed = semantic_class_from_name(*sc);
         if (!parsed) {
-            std::fprintf(stderr, "error: unknown class %s\n", sc->c_str());
-            std::exit(2);
+            throw CfError(ErrKind::InvalidArgument, "unknown class " + *sc);
         }
         md.semantic_class = *parsed;
     }
@@ -108,14 +162,18 @@ ContextMetadata make_metadata(const Args& args, const std::string& ns, const std
     if (size) {
         uint64_t bytes = 0;
         if (!parse_byte_size(*size, bytes) || bytes == 0) {
-            std::fprintf(stderr, "error: invalid --size %s\n", size->c_str());
-            std::exit(2);
+            throw CfError(ErrKind::InvalidArgument, "invalid --size " + *size);
         }
         md.byte_size = bytes;
         md.logical_size = bytes;
     }
-    auto bytes = args.u64("bytes");
-    if (bytes) {
+    auto bytes_text = args.value("bytes");
+    if (size && bytes_text) {
+        throw CfError(ErrKind::InvalidArgument, "--size and --bytes are mutually exclusive");
+    }
+    if (bytes_text) {
+        auto bytes = Args::parse_u64(*bytes_text);
+        if (!bytes || *bytes == 0) throw CfError(ErrKind::InvalidArgument, "invalid --bytes " + *bytes_text);
         md.byte_size = *bytes;
         md.logical_size = *bytes;
     }
@@ -123,8 +181,7 @@ ContextMetadata make_metadata(const Args& args, const std::string& ns, const std
     if (pers) {
         auto p = persistence_policy_from_name(*pers);
         if (!p) {
-            std::fprintf(stderr, "error: unknown persistence policy %s\n", pers->c_str());
-            std::exit(2);
+            throw CfError(ErrKind::InvalidArgument, "unknown persistence policy " + *pers);
         }
         md.persistence = *p;
     }
@@ -132,38 +189,49 @@ ContextMetadata make_metadata(const Args& args, const std::string& ns, const std
     if (sharing) {
         auto s = sharing_policy_from_name(*sharing);
         if (!s) {
-            std::fprintf(stderr, "error: unknown sharing policy %s\n", sharing->c_str());
-            std::exit(2);
+            throw CfError(ErrKind::InvalidArgument, "unknown sharing policy " + *sharing);
         }
         md.sharing = *s;
     }
     md.mutable_flag = args.has("mutable");
-    if (args.has("lifetime")) {
-        auto lt = args.u64("lifetime");
-        if (lt) md.lifetime_seconds = *lt;
+    if (auto lifetime = args.value("lifetime")) {
+        auto parsed = Args::parse_u64(*lifetime);
+        if (!parsed) throw CfError(ErrKind::InvalidArgument, "invalid --lifetime " + *lifetime);
+        md.lifetime_seconds = *parsed;
     }
-    if (args.has("recompute-sec")) {
-        auto rc = args.value("recompute-sec");
-        if (rc) md.recompute_seconds = std::atof(rc->c_str());
+    if (auto recompute = args.value("recompute-sec")) {
+        auto parsed = parse_finite_double(*recompute);
+        if (!parsed || *parsed < 0.0) {
+            throw CfError(ErrKind::InvalidArgument, "invalid --recompute-sec " + *recompute);
+        }
+        md.recompute_seconds = *parsed;
     }
-    if (args.has("reuse")) {
-        auto ru = args.value("reuse");
-        if (ru) md.reuse_probability = std::atof(ru->c_str());
+    if (auto reuse = args.value("reuse")) {
+        auto parsed = parse_finite_double(*reuse);
+        if (!parsed || *parsed < 0.0 || *parsed > 1.0) {
+            throw CfError(ErrKind::InvalidArgument, "invalid --reuse " + *reuse);
+        }
+        md.reuse_probability = *parsed;
     }
     md.producer = "context-fabric-cli";
     md.model_id = name;
     md.architecture_namespace = ns;
+    md.compatibility_fingerprint = md.compute_compatibility_fingerprint();
     return md;
 }
 
 int cmd_capabilities(const Args& args) {
-    (void)args;
+    if (!validate_args(args, {})) return 2;
     std::printf("Context Fabric %s\n", kVersionString);
     std::printf("protocol-version: %u\n", kProtocolVersion);
     std::printf("persist-format: %u\n", kPersistFormatVersion);
     std::printf("coordinator-format: %u\n", kCoordinatorFormatVersion);
     std::printf("telemetry-schema: %u\n", kTelemetrySchemaVersion);
-    std::printf("storage-domains: accelerator-local, host-memory, local-persistent, remote-memory, remote-persistent\n");
+    std::printf("storage-domains: host-memory, local-persistent\n");
+#if defined(CONTEXT_FABRIC_HAS_CUDA)
+    std::printf("optional-storage-domain: accelerator-local (requires a usable CUDA device)\n");
+#endif
+    std::printf("reserved-storage-domains: remote-memory, remote-persistent\n");
     std::printf("semantic-classes: generic, kv-cache, prefix-state, recurrent-state, tensor, embedding, retrieval-state, agent-state, tool-artifact, checkpoint, application-defined\n");
     std::printf("sharing-policies: private, namespace-shared, globally-shareable\n");
     std::printf("persistence-policies: volatile, ephemeral, persistent\n");
@@ -177,17 +245,13 @@ int cmd_capabilities(const Args& args) {
 }
 
 int cmd_coordinator(const Args& args) {
+    if (!validate_args(args, {"port", "store", "telemetry"}, {"quiet"})) return 2;
     Coordinator::Config cfg;
-    auto port = args.u16("port");
-    if (port) cfg.control_port = *port;
+    if (!parse_u16_option(args, "port", cfg.control_port)) return 2;
     auto store = args.value("store");
     if (store) cfg.store_path = *store;
     auto t = args.value("telemetry");
     if (t) cfg.telemetry_path = *t;
-    if (args.has("no-stderr")) {
-        // telemetry to file only; stderr still logs errors
-    }
-
     Telemetry telemetry;
     telemetry.set_stderr_enabled(!args.has("quiet"));
     Coordinator coord(cfg, telemetry);
@@ -205,6 +269,12 @@ int cmd_coordinator(const Args& args) {
 }
 
 int cmd_node(const Args& args) {
+    if (!validate_args(args,
+                       {"coordinator", "id", "store", "host-cap", "persist-cap", "accel-cap",
+                        "data-port", "telemetry", "label"},
+                       {"cuda", "quiet"})) {
+        return 2;
+    }
     NodeConfig cfg;
     std::string host;
     uint16_t port = 0;
@@ -213,7 +283,7 @@ int cmd_node(const Args& args) {
     cfg.coord_port = port;
 
     auto id = args.value("id");
-    if (!id) {
+    if (!id || id->empty()) {
         std::fprintf(stderr, "error: --id NAME is required\n");
         return 2;
     }
@@ -221,11 +291,16 @@ int cmd_node(const Args& args) {
     cfg.label = args.value("label").value_or(*id);
 
     auto store = args.value("store");
-    if (store) cfg.store_root = *store;
+    if (store) {
+        if (store->empty()) {
+            std::fprintf(stderr, "error: --store must not be empty\n");
+            return 2;
+        }
+        cfg.store_root = *store;
+    }
     uint64_t host_cap = 0;
-    if (args.has("host-cap")) {
-        auto s = args.value("host-cap");
-        if (s && !parse_byte_size(*s, host_cap)) {
+    if (auto s = args.value("host-cap")) {
+        if (!parse_byte_size(*s, host_cap) || host_cap == 0) {
             std::fprintf(stderr, "error: invalid --host-cap\n");
             return 2;
         }
@@ -233,20 +308,23 @@ int cmd_node(const Args& args) {
     if (host_cap == 0) host_cap = 256ull * 1024 * 1024;
     cfg.host_capacity = host_cap;
 
-    if (args.has("persist-cap")) {
-        auto s = args.value("persist-cap");
-        if (s && !parse_byte_size(*s, cfg.persistent_capacity)) {
+    if (auto s = args.value("persist-cap")) {
+        if (!store) {
+            std::fprintf(stderr, "error: --persist-cap requires --store\n");
+            return 2;
+        }
+        if (!parse_byte_size(*s, cfg.persistent_capacity) || cfg.persistent_capacity == 0) {
             std::fprintf(stderr, "error: invalid --persist-cap\n");
             return 2;
         }
-    } else if (!store) {
+    } else if (store) {
+        cfg.persistent_capacity = 1ull * 1024 * 1024 * 1024;
+    } else {
         cfg.persistent_capacity = 0;
     }
-    if (cfg.store_root.empty()) cfg.persistent_capacity = 0;
 
-    if (args.has("accel-cap")) {
-        auto s = args.value("accel-cap");
-        if (s && !parse_byte_size(*s, cfg.accelerator_capacity)) {
+    if (auto s = args.value("accel-cap")) {
+        if (!parse_byte_size(*s, cfg.accelerator_capacity) || cfg.accelerator_capacity == 0) {
             std::fprintf(stderr, "error: invalid --accel-cap\n");
             return 2;
         }
@@ -254,8 +332,13 @@ int cmd_node(const Args& args) {
         cfg.accelerator_capacity = 6ull * 1024 * 1024 * 1024;  // safe default
     }
     cfg.enable_cuda = args.has("cuda");
-    auto dp = args.u16("data-port");
-    if (dp) cfg.data_port = *dp;
+#if !defined(CONTEXT_FABRIC_HAS_CUDA)
+    if (cfg.enable_cuda) {
+        std::fprintf(stderr, "error: --cuda requested, but CUDA is not compiled into this build\n");
+        return 2;
+    }
+#endif
+    if (!parse_u16_option(args, "data-port", cfg.data_port)) return 2;
     auto t = args.value("telemetry");
     if (t) cfg.telemetry_path = *t;
 
@@ -264,6 +347,11 @@ int cmd_node(const Args& args) {
     NodeRuntime node(cfg, telemetry);
     if (!node.start()) {
         std::fprintf(stderr, "error: node failed to start\n");
+        return 1;
+    }
+    if (cfg.enable_cuda && node.accelerator() == nullptr) {
+        std::fprintf(stderr, "error: --cuda requested, but no usable CUDA device is available\n");
+        node.shutdown();
         return 1;
     }
     std::printf("node %s (%s) data=%s host_cap=%llu pid=%llu\n", cfg.label.c_str(),
@@ -277,19 +365,37 @@ int cmd_node(const Args& args) {
 }
 
 int cmd_fabric_local(const Args& args) {
+    if (!validate_args(args, {"nodes", "workload", "root", "coord-port", "size"},
+                       {"cuda-node", "retain", "quick"})) {
+        return 2;
+    }
     FabricLauncher::Config lcfg;
-    auto nodes = args.u64("nodes");
-    lcfg.node_count = nodes ? static_cast<size_t>(*nodes) : 3;
+    uint64_t nodes = 3;
+    if (!parse_u64_option(args, "nodes", nodes, 1, 64)) return 2;
+    lcfg.node_count = static_cast<size_t>(nodes);
     lcfg.enable_cuda_node = args.has("cuda-node");
+#if !defined(CONTEXT_FABRIC_HAS_CUDA)
+    if (lcfg.enable_cuda_node) {
+        std::fprintf(stderr, "error: --cuda-node requested, but CUDA is not compiled into this build\n");
+        return 2;
+    }
+#endif
     auto wl = args.value("workload");
     if (wl) lcfg.workload = *wl;
     lcfg.retain = args.has("retain");
     auto root = args.value("root");
-    if (root) lcfg.root = *root;
-    auto cp = args.u16("coord-port");
-    if (cp) lcfg.coord_port = *cp;
+    if (root) {
+        if (root->empty()) {
+            std::fprintf(stderr, "error: --root must not be empty\n");
+            return 2;
+        }
+        lcfg.root = *root;
+    }
+    uint16_t coord_port = 0;
+    if (!parse_u16_option(args, "coord-port", coord_port)) return 2;
+    lcfg.coord_port = coord_port;
     auto sizearg = args.value("size");
-    if (sizearg && !parse_byte_size(*sizearg, lcfg.workload_size)) {
+    if (sizearg && (!parse_byte_size(*sizearg, lcfg.workload_size) || lcfg.workload_size == 0)) {
         std::fprintf(stderr, "error: invalid --size\n");
         return 2;
     }
@@ -300,12 +406,19 @@ int cmd_fabric_local(const Args& args) {
 }
 
 int cmd_object_create(const Args& args) {
+    if (!validate_args(args,
+                       {"coordinator", "namespace", "name", "class", "size", "bytes", "owner",
+                        "seed", "persistence", "sharing", "lifetime", "recompute-sec", "reuse",
+                        "parent", "derivation"},
+                       {"mutable"})) {
+        return 2;
+    }
     std::string host;
     uint16_t port = 0;
     if (!parse_coord(args, host, port)) return 2;
     auto ns = args.value("namespace");
     auto name = args.value("name");
-    if (!ns || !name) {
+    if (!ns || !name || ns->empty() || name->empty()) {
         std::fprintf(stderr, "error: --namespace and --name are required\n");
         return 2;
     }
@@ -317,9 +430,10 @@ int cmd_object_create(const Args& args) {
     auto owner = args.value("owner");
     uint64_t owner_node = 0;
     if (owner) {
-        auto o = Args::parse_u64(*owner);
-        if (o) owner_node = *o;
-        else owner_node = NodeId::deterministic(*owner).value();
+        if (!parse_node_ref(*owner, owner_node)) {
+            std::fprintf(stderr, "error: invalid --owner\n");
+            return 2;
+        }
     }
     if (owner_node == 0) {
         // Default: ask the coordinator for a placement.
@@ -335,10 +449,7 @@ int cmd_object_create(const Args& args) {
     }
 
     uint64_t seed = 0;
-    if (args.has("seed")) {
-        auto s = args.u64("seed");
-        if (s) seed = *s;
-    }
+    if (!parse_u64_option(args, "seed", seed)) return 2;
     auto content = generate_content(seed, 0, md.byte_size);
 
     ObjectId parent;
@@ -362,6 +473,7 @@ int cmd_object_create(const Args& args) {
 }
 
 int cmd_object_inspect(const Args& args) {
+    if (!validate_args(args, {"coordinator", "id"})) return 2;
     std::string host;
     uint16_t port = 0;
     if (!parse_coord(args, host, port)) return 2;
@@ -413,6 +525,7 @@ int cmd_object_inspect(const Args& args) {
 }
 
 int cmd_object_list(const Args& args) {
+    if (!validate_args(args, {"coordinator", "namespace"}, {"json"})) return 2;
     std::string host;
     uint16_t port = 0;
     if (!parse_coord(args, host, port)) return 2;
@@ -436,6 +549,7 @@ int cmd_object_list(const Args& args) {
 }
 
 int cmd_object_lineage(const Args& args) {
+    if (!validate_args(args, {"coordinator", "id"})) return 2;
     std::string host;
     uint16_t port = 0;
     if (!parse_coord(args, host, port)) return 2;
@@ -461,6 +575,7 @@ int cmd_object_lineage(const Args& args) {
 }
 
 int cmd_object_delete(const Args& args) {
+    if (!validate_args(args, {"coordinator", "id"}, {"force"})) return 2;
     std::string host;
     uint16_t port = 0;
     if (!parse_coord(args, host, port)) return 2;
@@ -482,6 +597,7 @@ int cmd_object_delete(const Args& args) {
 }
 
 int cmd_lease_acquire(const Args& args) {
+    if (!validate_args(args, {"coordinator", "id", "holder", "mode", "duration"})) return 2;
     std::string host;
     uint16_t port = 0;
     if (!parse_coord(args, host, port)) return 2;
@@ -493,11 +609,17 @@ int cmd_lease_acquire(const Args& args) {
         return 2;
     }
     uint64_t holder_node = 0;
-    auto ho = Args::parse_u64(*holder);
-    if (ho) holder_node = *ho;
-    else holder_node = NodeId::deterministic(*holder).value();
+    if (!parse_node_ref(*holder, holder_node)) {
+        std::fprintf(stderr, "error: invalid --holder\n");
+        return 2;
+    }
+    if (*mode != "read" && *mode != "write") {
+        std::fprintf(stderr, "error: --mode must be read or write\n");
+        return 2;
+    }
     LeaseMode lm = *mode == "write" ? LeaseMode::Write : LeaseMode::Read;
-    uint64_t duration = args.u64("duration").value_or(0);
+    uint64_t duration = 0;
+    if (!parse_u64_option(args, "duration", duration)) return 2;
 
     ContextFabric cf;
     if (!cf.connect(host, port)) return 1;
@@ -518,24 +640,28 @@ int cmd_lease_acquire(const Args& args) {
 }
 
 int cmd_lease_release(const Args& args) {
+    if (!validate_args(args, {"coordinator", "id", "holder", "lease-id"})) return 2;
     std::string host;
     uint16_t port = 0;
     if (!parse_coord(args, host, port)) return 2;
     auto idstr = args.value("id");
     auto holder = args.value("holder");
-    auto lid = args.u64("lease-id");
-    if (!idstr || !holder || !lid) {
+    auto lid_text = args.value("lease-id");
+    if (!idstr || !holder || !lid_text) {
         std::fprintf(stderr, "error: --id, --holder, --lease-id required\n");
         return 2;
     }
+    uint64_t lease_id = 0;
+    if (!parse_u64_option(args, "lease-id", lease_id, 1)) return 2;
     uint64_t holder_node = 0;
-    auto ho = Args::parse_u64(*holder);
-    if (ho) holder_node = *ho;
-    else holder_node = NodeId::deterministic(*holder).value();
+    if (!parse_node_ref(*holder, holder_node)) {
+        std::fprintf(stderr, "error: invalid --holder\n");
+        return 2;
+    }
     ContextFabric cf;
     if (!cf.connect(host, port)) return 1;
     try {
-        cf.release_lease(ObjectId::from_hex(*idstr), holder_node, *lid);
+        cf.release_lease(ObjectId::from_hex(*idstr), holder_node, lease_id);
         std::printf("released\n");
         return 0;
     } catch (const CfError& e) {
@@ -545,6 +671,7 @@ int cmd_lease_release(const Args& args) {
 }
 
 int cmd_replicate(const Args& args) {
+    if (!validate_args(args, {"coordinator", "id", "to"})) return 2;
     std::string host;
     uint16_t port = 0;
     if (!parse_coord(args, host, port)) return 2;
@@ -555,9 +682,10 @@ int cmd_replicate(const Args& args) {
         return 2;
     }
     uint64_t target = 0;
-    auto tv = Args::parse_u64(*to);
-    if (tv) target = *tv;
-    else target = NodeId::deterministic(*to).value();
+    if (!parse_node_ref(*to, target)) {
+        std::fprintf(stderr, "error: invalid --to\n");
+        return 2;
+    }
     ContextFabric cf;
     if (!cf.connect(host, port)) return 1;
     try {
@@ -572,6 +700,7 @@ int cmd_replicate(const Args& args) {
 }
 
 int cmd_migrate(const Args& args) {
+    if (!validate_args(args, {"coordinator", "id", "to", "domain"}, {"keep-source"})) return 2;
     std::string host;
     uint16_t port = 0;
     if (!parse_coord(args, host, port)) return 2;
@@ -582,12 +711,20 @@ int cmd_migrate(const Args& args) {
         return 2;
     }
     uint64_t target = 0;
-    auto tv = Args::parse_u64(*to);
-    if (tv) target = *tv;
-    else target = NodeId::deterministic(*to).value();
+    if (!parse_node_ref(*to, target)) {
+        std::fprintf(stderr, "error: invalid --to\n");
+        return 2;
+    }
     StorageDomain domain = StorageDomain::HostMemory;
     auto dom = args.value("domain");
-    if (dom && *dom == "accelerator") domain = StorageDomain::AcceleratorLocal;
+    if (dom) {
+        if (*dom == "accelerator") {
+            domain = StorageDomain::AcceleratorLocal;
+        } else if (*dom != "host") {
+            std::fprintf(stderr, "error: --domain must be host or accelerator\n");
+            return 2;
+        }
+    }
     ContextFabric cf;
     if (!cf.connect(host, port)) return 1;
     try {
@@ -603,6 +740,7 @@ int cmd_migrate(const Args& args) {
 }
 
 int cmd_persist(const Args& args) {
+    if (!validate_args(args, {"coordinator", "id", "on"})) return 2;
     std::string host;
     uint16_t port = 0;
     if (!parse_coord(args, host, port)) return 2;
@@ -612,12 +750,10 @@ int cmd_persist(const Args& args) {
         return 2;
     }
     uint64_t on_node = 0;
-    if (args.has("on")) {
-        auto o = args.value("on");
-        if (o) {
-            auto ov = Args::parse_u64(*o);
-            if (ov) on_node = *ov;
-            else on_node = NodeId::deterministic(*o).value();
+    if (auto o = args.value("on")) {
+        if (!parse_node_ref(*o, on_node)) {
+            std::fprintf(stderr, "error: invalid --on\n");
+            return 2;
         }
     }
     ContextFabric cf;
@@ -633,6 +769,7 @@ int cmd_persist(const Args& args) {
 }
 
 int cmd_restore(const Args& args) {
+    if (!validate_args(args, {"coordinator", "id", "to"})) return 2;
     std::string host;
     uint16_t port = 0;
     if (!parse_coord(args, host, port)) return 2;
@@ -642,12 +779,10 @@ int cmd_restore(const Args& args) {
         return 2;
     }
     uint64_t to_node = 0;
-    if (args.has("to")) {
-        auto o = args.value("to");
-        if (o) {
-            auto ov = Args::parse_u64(*o);
-            if (ov) to_node = *ov;
-            else to_node = NodeId::deterministic(*o).value();
+    if (auto o = args.value("to")) {
+        if (!parse_node_ref(*o, to_node)) {
+            std::fprintf(stderr, "error: invalid --to\n");
+            return 2;
         }
     }
     ContextFabric cf;
@@ -664,6 +799,7 @@ int cmd_restore(const Args& args) {
 }
 
 int cmd_verify(const Args& args) {
+    if (!validate_args(args, {"coordinator", "id", "on"}, {"deep"})) return 2;
     std::string host;
     uint16_t port = 0;
     if (!parse_coord(args, host, port)) return 2;
@@ -673,12 +809,10 @@ int cmd_verify(const Args& args) {
         return 2;
     }
     uint64_t on_node = 0;
-    if (args.has("on")) {
-        auto o = args.value("on");
-        if (o) {
-            auto ov = Args::parse_u64(*o);
-            if (ov) on_node = *ov;
-            else on_node = NodeId::deterministic(*o).value();
+    if (auto o = args.value("on")) {
+        if (!parse_node_ref(*o, on_node)) {
+            std::fprintf(stderr, "error: invalid --on\n");
+            return 2;
         }
     }
     ContextFabric cf;
@@ -697,12 +831,18 @@ int cmd_verify(const Args& args) {
 }
 
 int cmd_placement(const Args& args) {
+    if (!validate_args(args,
+                       {"coordinator", "namespace", "name", "class", "size", "bytes", "current",
+                        "persistence", "sharing", "lifetime", "recompute-sec", "reuse"},
+                       {"mutable"})) {
+        return 2;
+    }
     std::string host;
     uint16_t port = 0;
     if (!parse_coord(args, host, port)) return 2;
     auto ns = args.value("namespace");
     auto name = args.value("name");
-    if (!ns || !name) {
+    if (!ns || !name || ns->empty() || name->empty()) {
         std::fprintf(stderr, "error: --namespace and --name required\n");
         return 2;
     }
@@ -712,12 +852,10 @@ int cmd_placement(const Args& args) {
         return 2;
     }
     uint64_t current = 0;
-    if (args.has("current")) {
-        auto o = args.value("current");
-        if (o) {
-            auto ov = Args::parse_u64(*o);
-            if (ov) current = *ov;
-            else current = NodeId::deterministic(*o).value();
+    if (auto o = args.value("current")) {
+        if (!parse_node_ref(*o, current)) {
+            std::fprintf(stderr, "error: invalid --current\n");
+            return 2;
         }
     }
     ContextFabric cf;
@@ -737,12 +875,19 @@ int cmd_placement(const Args& args) {
 }
 
 int cmd_decide(const Args& args) {
+    if (!validate_args(args,
+                       {"coordinator", "namespace", "name", "class", "size", "bytes", "current",
+                        "target", "bandwidth", "persistence", "sharing", "lifetime", "recompute-sec",
+                        "reuse"},
+                       {"mutable"})) {
+        return 2;
+    }
     std::string host;
     uint16_t port = 0;
     if (!parse_coord(args, host, port)) return 2;
     auto ns = args.value("namespace");
     auto name = args.value("name");
-    if (!ns || !name) {
+    if (!ns || !name || ns->empty() || name->empty()) {
         std::fprintf(stderr, "error: --namespace and --name required\n");
         return 2;
     }
@@ -758,11 +903,13 @@ int cmd_decide(const Args& args) {
         return 2;
     }
     uint64_t cn = 0, tn = 0;
-    auto cv = Args::parse_u64(*current);
-    cn = cv ? *cv : NodeId::deterministic(*current).value();
-    auto tv = Args::parse_u64(*target);
-    tn = tv ? *tv : NodeId::deterministic(*target).value();
-    double bw = static_cast<double>(args.u64("bandwidth").value_or(1000000000ull));
+    if (!parse_node_ref(*current, cn) || !parse_node_ref(*target, tn)) {
+        std::fprintf(stderr, "error: invalid --current or --target\n");
+        return 2;
+    }
+    uint64_t bandwidth = 1000000000ull;
+    if (!parse_u64_option(args, "bandwidth", bandwidth, 1)) return 2;
+    double bw = static_cast<double>(bandwidth);
     ContextFabric cf;
     if (!cf.connect(host, port)) return 1;
     try {
@@ -781,11 +928,8 @@ int cmd_decide(const Args& args) {
 }
 
 int cmd_benchmark(const Args& args) {
-    std::string host;
-    uint16_t port = 0;
-    bool have_coord = args.value("coordinator").has_value();
-    if (have_coord && !parse_coord(args, host, port)) return 2;
-    return run_benchmarks(args, host, port, have_coord);
+    if (!validate_args(args, {"size"}, {"quick", "cuda"})) return 2;
+    return run_benchmarks(args);
 }
 
 }  // namespace
@@ -793,11 +937,20 @@ int cmd_benchmark(const Args& args) {
 int cli_main(int argc, char** argv) {
     Args args(argc, argv);
     std::string cmd = args.next();
+    try {
     if (cmd.empty() || cmd == "help" || cmd == "--help" || cmd == "-h") {
+        if (args.has_next()) {
+            std::fprintf(stderr, "error: help does not accept additional arguments\n");
+            return 2;
+        }
         print_help();
         return 0;
     }
     if (cmd == "--version" || cmd == "version") {
+        if (args.has_next()) {
+            std::fprintf(stderr, "error: version does not accept additional arguments\n");
+            return 2;
+        }
         std::printf("context-fabric %s (protocol v%u)\n", kVersionString, kProtocolVersion);
         return 0;
     }
@@ -839,6 +992,13 @@ int cli_main(int argc, char** argv) {
     std::fprintf(stderr, "error: unknown command %s\n", cmd.c_str());
     print_help();
     return 2;
+    } catch (const CfError& e) {
+        std::fprintf(stderr, "error: %s (%s)\n", e.what(), e.code_string().c_str());
+        return e.kind() == ErrKind::InvalidArgument ? 2 : 1;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
 }
 
 }  // namespace ctf

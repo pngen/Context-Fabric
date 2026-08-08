@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <thread>
 
 #include "context_fabric/api/context_fabric.h"
@@ -21,23 +22,48 @@ namespace fs = std::filesystem;
 
 namespace {
 
+class OwnedTempDirectory {
+public:
+    OwnedTempDirectory() {
+        path_ = fs::temp_directory_path() / ("context-fabric-bench-" + ObjectId::random().to_hex());
+        std::error_code ec;
+        if (!fs::create_directory(path_, ec) || ec) {
+            throw CfError(ErrKind::Persistence, "cannot create unique benchmark directory: " + ec.message());
+        }
+    }
+    ~OwnedTempDirectory() {
+        std::error_code ec;
+        fs::remove_all(path_, ec);
+    }
+    OwnedTempDirectory(const OwnedTempDirectory&) = delete;
+    OwnedTempDirectory& operator=(const OwnedTempDirectory&) = delete;
+    [[nodiscard]] const fs::path& path() const noexcept { return path_; }
+
+private:
+    fs::path path_;
+};
+
 struct InProcessFabric {
-    std::string store_path;
+    OwnedTempDirectory root;
     Telemetry telemetry;
     Coordinator coord;
     std::vector<std::unique_ptr<Telemetry>> node_telemetry;
     std::vector<std::unique_ptr<NodeRuntime>> nodes;
 
     InProcessFabric(size_t node_count, bool with_store, bool cuda)
-        : store_path(make_store()), coord(make_coord_cfg(store_path), telemetry) {
+        : coord(make_coord_cfg((root.path() / "coordinator.store").string()), telemetry) {
         telemetry.set_stderr_enabled(false);
         if (!coord.start()) throw CfError(ErrKind::Internal, "bench coordinator start failed");
         uint16_t port = coord.bound_port();
         for (size_t i = 0; i < node_count; ++i) {
             auto t = std::make_unique<Telemetry>();
             t->set_stderr_enabled(false);
-            auto n = std::make_unique<NodeRuntime>(make_node_cfg(i, with_store, cuda, port), *t);
+            auto n = std::make_unique<NodeRuntime>(make_node_cfg(root.path(), i, with_store, cuda && i == 0, port),
+                                                   *t);
             if (!n->start()) throw CfError(ErrKind::Internal, "bench node start failed");
+            if (cuda && i == 0 && n->accelerator() == nullptr) {
+                throw CfError(ErrKind::NotSupported, "CUDA benchmark requested but no usable CUDA device exists");
+            }
             node_telemetry.push_back(std::move(t));
             nodes.push_back(std::move(n));
         }
@@ -47,15 +73,13 @@ struct InProcessFabric {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             waited += 50;
         }
+        if (coord.online_node_count() != node_count) {
+            throw CfError(ErrKind::Timeout, "benchmark nodes did not register within 10 seconds");
+        }
     }
     ~InProcessFabric() {
         for (auto& n : nodes) n->shutdown();
         coord.shutdown();
-        std::error_code ec;
-        fs::remove(store_path, ec);
-    }
-    static std::string make_store() {
-        return (fs::temp_directory_path() / ("ctf-bench-" + ObjectId::random().to_hex())).string() + ".store";
     }
     static Coordinator::Config make_coord_cfg(const std::string& store) {
         Coordinator::Config cfg;
@@ -71,7 +95,8 @@ struct InProcessFabric {
         cfg.driver_threads = 4;
         return cfg;
     }
-    static NodeConfig make_node_cfg(size_t i, bool with_store, bool cuda, uint16_t coord_port) {
+    static NodeConfig make_node_cfg(const fs::path& root_path, size_t i, bool with_store, bool cuda,
+                                    uint16_t coord_port) {
         NodeConfig cfg;
         cfg.node_id = NodeId::deterministic("bench-node-" + std::to_string(i));
         cfg.label = "bench-node-" + std::to_string(i);
@@ -83,10 +108,8 @@ struct InProcessFabric {
         cfg.heartbeat_interval_ms = 500;
         cfg.transfer_workers = 4;
         if (with_store) {
-            cfg.store_root = (fs::temp_directory_path() / ("ctf-bench-node-" + std::to_string(i))).string();
+            cfg.store_root = (root_path / ("node-" + std::to_string(i))).string();
             cfg.persistent_capacity = 1ull * 1024 * 1024 * 1024;
-            std::error_code ec;
-            fs::remove_all(cfg.store_root, ec);
         }
         return cfg;
     }
@@ -118,70 +141,92 @@ ContextMetadata bench_meta(uint64_t bytes, double recompute = 5.0) {
     return md;
 }
 
+using BenchClock = std::chrono::steady_clock;
+
+double elapsed_ms(BenchClock::time_point start) {
+    return std::chrono::duration<double, std::milli>(BenchClock::now() - start).count();
+}
+
+double throughput_mbps(uint64_t bytes, double milliseconds) {
+    if (!(milliseconds > 0.0)) return 0.0;
+    return static_cast<double>(bytes) / 1000000.0 / (milliseconds / 1000.0);
+}
+
 }  // namespace
 
 int run_benchmark_suite(const BenchConfig& cfg) {
     std::printf("Context Fabric benchmark suite\n");
-    std::printf("coordinator: %s:%u%s\n", cfg.coord_host.c_str(), cfg.coord_port,
-                cfg.coord_port == 0 ? " (in-process)" : "");
+    std::printf("fabric: owned in-process coordinator and nodes\n");
     std::fflush(stdout);
 
-    bench_local_reuse(cfg);
-    bench_remote_reuse(cfg);
-    bench_replication(cfg);
-    bench_migration(cfg);
-    bench_persist_restore(cfg);
-    bench_placement(cfg);
-    bench_transfer_vs_recompute(cfg);
-    bench_hot_cold(cfg);
-    bench_failure_recovery(cfg);
-    bench_capacity_pressure(cfg);
+    bool passed = true;
+    auto run = [&](const char* name, const std::function<bool()>& benchmark) {
+        try {
+            if (!benchmark()) {
+                std::fprintf(stderr, "benchmark failed: %s\n", name);
+                passed = false;
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "benchmark failed: %s: %s\n", name, e.what());
+            passed = false;
+        }
+    };
+    run("local reuse", [&] { return bench_local_reuse(cfg); });
+    run("remote reuse", [&] { return bench_remote_reuse(cfg); });
+    run("replication", [&] { return bench_replication(cfg); });
+    run("migration", [&] { return bench_migration(cfg); });
+    run("persist/restore", [&] { return bench_persist_restore(cfg); });
+    run("placement", [&] { return bench_placement(cfg); });
+    run("transfer vs recompute", [&] { return bench_transfer_vs_recompute(cfg); });
+    run("hot/cold", [&] { return bench_hot_cold(cfg); });
+    run("failure recovery", [&] { return bench_failure_recovery(cfg); });
+    run("capacity pressure", [&] { return bench_capacity_pressure(cfg); });
     if (cfg.cuda) {
-        bench_cuda_roundtrip(cfg);
-        bench_cuda_remote_path(cfg);
+        run("CUDA round trip", [&] { return bench_cuda_roundtrip(cfg); });
+        run("CUDA remote path", [&] { return bench_cuda_remote_path(cfg); });
     }
-    bench_multiprocess_fabric(cfg);
 
-    std::printf("=== benchmark suite complete ===\n");
-    return 0;
+    std::printf("=== benchmark suite %s ===\n", passed ? "complete" : "FAILED");
+    return passed ? 0 : 1;
 }
 
-void bench_local_reuse(const BenchConfig& cfg) {
+bool bench_local_reuse(const BenchConfig& cfg) {
     uint64_t size = cfg.quick ? 2ull * 1024 * 1024 : cfg.object_size;
-    print_config("LOCAL OBJECT REUSE", cfg, size);
+    print_config("LOCAL OBJECT REUSE (deep authoritative verification)", cfg, size);
     InProcessFabric fab(1, false, false);
     ContextFabric cf;
-    if (!cf.connect("127.0.0.1", fab.port(), 5000)) return;
+    if (!cf.connect("127.0.0.1", fab.port(), 5000)) return false;
     uint64_t node0 = fab.node(0).node_id().value();
     auto md = bench_meta(size, 2.0);
     auto content = generate_content(1, 1, size);
     ObjectId id = cf.create_object(md, node0, content);
 
     // Local hit: verify (read from the authoritative node's host memory).
-    uint64_t start = steady_now_ms();
+    auto start = BenchClock::now();
     int iters = cfg.quick ? 20 : 100;
     for (int i = 0; i < iters; ++i) {
         auto vr = cf.verify(id, node0, true);
         if (!vr.ok) {
             std::printf("verify failed\n");
-            return;
+            return false;
         }
     }
-    uint64_t elapsed = steady_now_ms() - start;
-    double per_hit = static_cast<double>(elapsed) / iters;
-    std::printf("result: local_hit_latency_ms=%.3f iters=%d bytes=%llu\n", per_hit, iters,
+    double elapsed = elapsed_ms(start);
+    double per_hit = elapsed / iters;
+    std::printf("result: local_verify_latency_ms=%.3f iters=%d bytes=%llu\n", per_hit, iters,
                 static_cast<unsigned long long>(size));
-    std::printf("result: estimated_recompute_seconds=2.0 per-hit; reuse avoided %.2f s total\n",
-                per_hit / 1000.0 * iters);
+    std::printf("result: estimated_recompute_seconds=2.0 per-hit; estimated recompute avoided %.2f s total\n",
+                2.0 * iters);
     std::fflush(stdout);
+    return true;
 }
 
-void bench_remote_reuse(const BenchConfig& cfg) {
+bool bench_remote_reuse(const BenchConfig& cfg) {
     uint64_t size = cfg.quick ? 2ull * 1024 * 1024 : cfg.object_size;
-    print_config("REMOTE REUSE (node B -> node A over TCP)", cfg, size);
+    print_config("REMOTE REUSE (deep replica verification after TCP replication)", cfg, size);
     InProcessFabric fab(2, false, false);
     ContextFabric cf;
-    if (!cf.connect("127.0.0.1", fab.port(), 5000)) return;
+    if (!cf.connect("127.0.0.1", fab.port(), 5000)) return false;
     uint64_t node0 = fab.node(0).node_id().value();
     uint64_t node1 = fab.node(1).node_id().value();
     auto md = bench_meta(size);
@@ -190,26 +235,27 @@ void bench_remote_reuse(const BenchConfig& cfg) {
     cf.replicate(id, node1);
 
     // Remote reuse: verify the replica on node1 (reads node1's host memory).
-    uint64_t start = steady_now_ms();
+    auto start = BenchClock::now();
     int iters = cfg.quick ? 20 : 100;
     for (int i = 0; i < iters; ++i) {
         auto vr = cf.verify(id, node1, true);
         if (!vr.ok) {
             std::printf("verify failed\n");
-            return;
+            return false;
         }
     }
-    uint64_t elapsed = steady_now_ms() - start;
-    std::printf("result: remote_hit_latency_ms=%.3f iters=%d\n", static_cast<double>(elapsed) / iters, iters);
+    double elapsed = elapsed_ms(start);
+    std::printf("result: replica_verify_latency_ms=%.3f iters=%d\n", elapsed / iters, iters);
     std::fflush(stdout);
+    return true;
 }
 
-void bench_replication(const BenchConfig& cfg) {
+bool bench_replication(const BenchConfig& cfg) {
     uint64_t size = cfg.quick ? 4ull * 1024 * 1024 : cfg.object_size;
     print_config("REPLICATION (node0 -> node1 over TCP)", cfg, size);
     InProcessFabric fab(2, false, false);
     ContextFabric cf;
-    if (!cf.connect("127.0.0.1", fab.port(), 5000)) return;
+    if (!cf.connect("127.0.0.1", fab.port(), 5000)) return false;
     uint64_t node0 = fab.node(0).node_id().value();
     uint64_t node1 = fab.node(1).node_id().value();
     auto md = bench_meta(size);
@@ -218,77 +264,83 @@ void bench_replication(const BenchConfig& cfg) {
     // Warm up once.
     cf.replicate(id, node1);
     cf.remove(id);
-    ObjectId id2 = cf.create_object(md, node0, generate_content(3, 3, size));
-
     int iters = cfg.quick ? 3 : 10;
     uint64_t total_bytes = 0;
-    uint64_t total_ms = 0;
+    double total_ms = 0.0;
     for (int i = 0; i < iters; ++i) {
         ObjectId fresh = cf.create_object(md, node0, generate_content(3, static_cast<uint64_t>(i), size));
-        uint64_t t0 = steady_now_ms();
+        auto t0 = BenchClock::now();
         auto r = cf.replicate(fresh, node1);
-        (void)r;
-        uint64_t dur = steady_now_ms() - t0;
+        double dur = elapsed_ms(t0);
+        if (r.node_id != node1) return false;
         total_ms += dur;
         total_bytes += size;
+        if (!cf.verify(fresh, node1, true).ok) return false;
+        cf.remove(fresh);
     }
-    double mbps = total_bytes / 1000000.0 / (total_ms / 1000.0);
+    double mbps = throughput_mbps(total_bytes, total_ms);
     std::printf("result: replicate_avg_ms=%.2f bytes=%llu throughput_mbps=%.2f\n",
-                static_cast<double>(total_ms) / iters, static_cast<unsigned long long>(size), mbps);
+                total_ms / iters, static_cast<unsigned long long>(size), mbps);
     std::fflush(stdout);
+    return total_ms > 0.0;
 }
 
-void bench_migration(const BenchConfig& cfg) {
+bool bench_migration(const BenchConfig& cfg) {
     print_config("MIGRATION (node0 -> node1 over TCP)", cfg, cfg.object_size);
     InProcessFabric fab(2, false, false);
     ContextFabric cf;
-    if (!cf.connect("127.0.0.1", fab.port(), 5000)) return;
+    if (!cf.connect("127.0.0.1", fab.port(), 5000)) return false;
     uint64_t node0 = fab.node(0).node_id().value();
     uint64_t node1 = fab.node(1).node_id().value();
 
-    const uint64_t sizes[] = {1ull << 20, 4ull << 20, 16ull << 20};
+    std::vector<uint64_t> sizes = cfg.quick ? std::vector<uint64_t>{1ull << 20, 4ull << 20}
+                                             : std::vector<uint64_t>{1ull << 20, 4ull << 20, 16ull << 20};
+    if (!cfg.quick && cfg.object_size != sizes.back()) sizes.push_back(cfg.object_size);
     for (uint64_t size : sizes) {
         auto md = bench_meta(size);
         ObjectId id = cf.create_object(md, node0, generate_content(4, size, size));
-        uint64_t t0 = steady_now_ms();
+        auto t0 = BenchClock::now();
         auto r = cf.migrate(id, node1, StorageDomain::HostMemory, false);
-        uint64_t dur = steady_now_ms() - t0;
+        double dur = elapsed_ms(t0);
         if (r.node_id != node1) {
             std::printf("migrate failed\n");
-            return;
+            return false;
         }
-        double mbps = size / 1000000.0 / (dur / 1000.0);
+        auto inspected = cf.inspect(id);
+        if (inspected.authoritative_node != node1 || !cf.verify(id, node1, true).ok) return false;
+        double mbps = throughput_mbps(size, dur);
         std::printf("result: migrate_size=%llu latency_ms=%.2f throughput_mbps=%.2f\n",
-                    static_cast<unsigned long long>(size), static_cast<double>(dur), mbps);
+                    static_cast<unsigned long long>(size), dur, mbps);
         std::fflush(stdout);
         cf.remove(id);
     }
+    return true;
 }
 
-void bench_persist_restore(const BenchConfig& cfg) {
+bool bench_persist_restore(const BenchConfig& cfg) {
     uint64_t size = cfg.quick ? 4ull * 1024 * 1024 : cfg.object_size;
     print_config("PERSIST/RESTORE (host <-> local persistent)", cfg, size);
     InProcessFabric fab(1, true, false);
     ContextFabric cf;
-    if (!cf.connect("127.0.0.1", fab.port(), 5000)) return;
+    if (!cf.connect("127.0.0.1", fab.port(), 5000)) return false;
     uint64_t node0 = fab.node(0).node_id().value();
     auto md = bench_meta(size);
     md.persistence = PersistencePolicy::Persistent;
     ObjectId id = cf.create_object(md, node0, generate_content(5, 5, size));
 
-    uint64_t t0 = steady_now_ms();
+    auto t0 = BenchClock::now();
     cf.persist(id, node0);
-    uint64_t persist_ms = steady_now_ms() - t0;
-    t0 = steady_now_ms();
+    double persist_ms = elapsed_ms(t0);
+    t0 = BenchClock::now();
     cf.restore(id, node0);
-    uint64_t restore_ms = steady_now_ms() - t0;
-    double mbps = size / 1000000.0 / (persist_ms / 1000.0);
-    std::printf("result: persist_ms=%.2f restore_ms=%.2f write_mbps=%.2f\n", static_cast<double>(persist_ms),
-                static_cast<double>(restore_ms), mbps);
+    double restore_ms = elapsed_ms(t0);
+    double mbps = throughput_mbps(size, persist_ms);
+    std::printf("result: persist_ms=%.2f restore_ms=%.2f write_mbps=%.2f\n", persist_ms, restore_ms, mbps);
     std::fflush(stdout);
+    return persist_ms > 0.0 && restore_ms > 0.0;
 }
 
-void bench_placement(const BenchConfig& cfg) {
+bool bench_placement(const BenchConfig& cfg) {
     print_config("PLACEMENT (deterministic policy inputs)", cfg, cfg.object_size);
     PlacementEngine engine;
     std::vector<PlacementCandidate> cands;
@@ -309,14 +361,15 @@ void bench_placement(const BenchConfig& cfg) {
     auto d2 = engine.decide(md, Location(), cands, "cost-aware");
     std::printf("result: chosen_node=%llu score=%.4f reason=%s\n",
                 static_cast<unsigned long long>(d1.location.node_id), d1.score, d1.reason.c_str());
-    std::printf("result: deterministic=%s\n", (d1.location.node_id == d2.location.node_id &&
-                                               d1.reason == d2.reason)
-                                                  ? "yes"
-                                                  : "NO");
+    bool deterministic = d1.location.node_id == d2.location.node_id && d1.reason == d2.reason;
+    bool expected_choice = d1.location.node_id == 100;
+    std::printf("result: deterministic=%s\n", deterministic ? "yes" : "NO");
+    std::printf("result: expected_largest_headroom=%s\n", expected_choice ? "yes" : "NO");
     std::fflush(stdout);
+    return deterministic && expected_choice;
 }
 
-void bench_transfer_vs_recompute(const BenchConfig& cfg) {
+bool bench_transfer_vs_recompute(const BenchConfig& cfg) {
     print_config("TRANSFER VS RECOMPUTE", cfg, cfg.object_size);
     TransferVsRecompute planner;
     // Expensive state: transfer is cheaper than recompute.
@@ -330,26 +383,28 @@ void bench_transfer_vs_recompute(const BenchConfig& cfg) {
     std::printf("cheap:     chose=%s (%s)\n", d_recompute.chose_transfer ? "transfer" : "recompute",
                 d_recompute.reason.c_str());
     std::fflush(stdout);
+    return d_transfer.chose_transfer && !d_recompute.chose_transfer;
 }
 
-void bench_hot_cold(const BenchConfig& cfg) {
+bool bench_hot_cold(const BenchConfig& cfg) {
     uint64_t size = cfg.quick ? 1ull * 1024 * 1024 : 4ull * 1024 * 1024;
     print_config("HOT/COLD STATE", cfg, size);
     TransferVsRecompute hot_planner(ReusePolicy{1.0, 1.0, 1e9, 100});
     TransferVsRecompute cold_planner(ReusePolicy{1.0, 1.0, 1e9, 1});
-    ContextMetadata md = bench_meta(size, 1.0);
+    ContextMetadata md = bench_meta(size, 0.0005);
     auto hot = hot_planner.decide(md, 1, 2, 1e9);
     auto cold = cold_planner.decide(md, 1, 2, 1e9);
     std::printf("hot:  chose=%s\n", hot.chose_transfer ? "transfer" : "recompute");
     std::printf("cold: chose=%s\n", cold.chose_transfer ? "transfer" : "recompute");
     std::fflush(stdout);
+    return hot.chose_transfer && !cold.chose_transfer;
 }
 
-void bench_failure_recovery(const BenchConfig& cfg) {
-    print_config("FAILURE RECOVERY (node loss + coordinator restart)", cfg, cfg.object_size);
+bool bench_failure_recovery(const BenchConfig& cfg) {
+    print_config("FAILURE RECOVERY (node loss and replica promotion)", cfg, cfg.object_size);
     InProcessFabric fab(2, false, false);
     ContextFabric cf;
-    if (!cf.connect("127.0.0.1", fab.port(), 5000)) return;
+    if (!cf.connect("127.0.0.1", fab.port(), 5000)) return false;
     uint64_t node0 = fab.node(0).node_id().value();
     uint64_t node1 = fab.node(1).node_id().value();
     auto md = bench_meta(cfg.object_size);
@@ -375,24 +430,19 @@ void bench_failure_recovery(const BenchConfig& cfg) {
     }
     std::printf("result: promoted_after_node_loss=%s (waited %llu ms)\n", promoted ? "yes" : "NO",
                 static_cast<unsigned long long>(waited));
+    bool verified = false;
     if (promoted) {
         auto vr = cf.verify(id, node1, true);
+        verified = vr.ok;
         std::printf("result: promoted_copy_verified=%s\n", vr.ok ? "yes" : "NO");
     }
     std::fflush(stdout);
+    return promoted && verified;
 }
 
-void bench_capacity_pressure(const BenchConfig& cfg) {
+bool bench_capacity_pressure(const BenchConfig& cfg) {
     print_config("CAPACITY PRESSURE", cfg, cfg.object_size);
     // A node with a tight host budget must reject oversized objects gracefully.
-    NodeConfig ncfg;
-    ncfg.node_id = NodeId::deterministic("small-node");
-    ncfg.label = "small-node";
-    ncfg.host_capacity = 8ull * 1024 * 1024;
-    ncfg.heartbeat_interval_ms = 500;
-
-    Telemetry t;
-    t.set_stderr_enabled(false);
     // Use a direct host backend to exercise the capacity boundary.
     HostMemoryBackend host(8ull * 1024 * 1024);
     auto big = generate_content(9, 9, 16ull * 1024 * 1024);
@@ -404,79 +454,86 @@ void bench_capacity_pressure(const BenchConfig& cfg) {
     }
     std::printf("result: oversized_put_rejected=%s\n", rejected ? "yes" : "NO");
     std::fflush(stdout);
+    return rejected;
 }
 
-void bench_cuda_roundtrip(const BenchConfig& cfg) {
+bool bench_cuda_roundtrip(const BenchConfig& cfg) {
     uint64_t size = cfg.quick ? 8ull * 1024 * 1024 : 64ull * 1024 * 1024;
-    print_config("CUDA ROUND TRIP (host -> RTX 5090 -> host)", cfg, size);
+    print_config("CUDA ROUND TRIP (host -> CUDA device -> host)", cfg, size);
     std::unique_ptr<AcceleratorBackend> acc(create_accelerator_backend(1ull * 1024 * 1024 * 1024));
     if (!acc || !acc->available()) {
-        std::printf("result: skipped (no CUDA device)\n");
-        return;
+        std::printf("result: FAILED (--cuda requested but no CUDA device is available)\n");
+        return false;
     }
     acc->set_device(0);
     auto content = generate_content(10, 10, size);
     IntegrityId expected = compute_integrity(content.data(), content.size());
     uint8_t* device = nullptr;
     acc->allocate(device, size);
-    uint64_t t0 = steady_now_ms();
+    struct DeviceAllocation {
+        AcceleratorBackend* backend;
+        uint8_t*& pointer;
+        ~DeviceAllocation() {
+            if (pointer == nullptr) return;
+            try {
+                backend->free(pointer);
+            } catch (...) {
+            }
+            pointer = nullptr;
+        }
+    } allocation{acc.get(), device};
+    auto t0 = BenchClock::now();
     acc->copy_h2d(device, content.data(), size);
     acc->synchronize();
-    uint64_t h2d = steady_now_ms() - t0;
-    t0 = steady_now_ms();
+    double h2d = elapsed_ms(t0);
+    t0 = BenchClock::now();
     acc->verify(device, size, expected.crc32c, expected.sha);
-    uint64_t verify = steady_now_ms() - t0;
-    t0 = steady_now_ms();
+    double verify = elapsed_ms(t0);
+    t0 = BenchClock::now();
     std::vector<uint8_t> back(size);
     acc->copy_d2h(back.data(), device, size);
     acc->synchronize();
-    uint64_t d2h = steady_now_ms() - t0;
+    double d2h = elapsed_ms(t0);
     bool ok = back == content;
     std::printf("result: h2d_ms=%.2f d2h_ms=%.2f verify_ms=%.2f bytes=%llu byte_exact=%s device=%s\n",
-                static_cast<double>(h2d), static_cast<double>(d2h), static_cast<double>(verify),
+                h2d, d2h, verify,
                 static_cast<unsigned long long>(size), ok ? "yes" : "NO", acc->device_name(0).c_str());
     acc->free(device);
+    device = nullptr;
     acc->shutdown();
     std::fflush(stdout);
+    return ok;
 }
 
-void bench_cuda_remote_path(const BenchConfig& cfg) {
+bool bench_cuda_remote_path(const BenchConfig& cfg) {
     uint64_t size = cfg.quick ? 4ull * 1024 * 1024 : 16ull * 1024 * 1024;
-    print_config("CUDA REMOTE PATH (node B -> node A host -> RTX 5090)", cfg, size);
+    print_config("CUDA REMOTE PATH (node B -> node A CUDA device)", cfg, size);
     InProcessFabric fab(2, false, true);
     ContextFabric cf;
-    if (!cf.connect("127.0.0.1", fab.port(), 5000)) return;
+    if (!cf.connect("127.0.0.1", fab.port(), 5000)) return false;
     uint64_t cuda_node = fab.node(0).node_id().value();
     uint64_t other_node = fab.node(1).node_id().value();
     // node0 must be the CUDA-capable node.
     if (!fab.node_mut(0).accelerator() || !fab.node_mut(0).accelerator()->available()) {
-        std::printf("result: skipped (no CUDA node)\n");
-        return;
+        std::printf("result: FAILED (--cuda requested but no CUDA node is available)\n");
+        return false;
     }
     auto md = bench_meta(size);
     // Create on the non-CUDA node, then migrate into the CUDA node's
     // accelerator domain.
     ObjectId id = cf.create_object(md, other_node, generate_content(11, 11, size));
-    uint64_t t0 = steady_now_ms();
+    auto t0 = BenchClock::now();
     auto loc = cf.migrate(id, cuda_node, StorageDomain::AcceleratorLocal, false);
-    uint64_t dur = steady_now_ms() - t0;
+    double dur = elapsed_ms(t0);
     if (loc.domain != StorageDomain::AcceleratorLocal) {
         std::printf("result: migrate-to-accelerator failed\n");
-        return;
+        return false;
     }
     auto vr = cf.verify(id, cuda_node, true);
-    std::printf("result: remote_to_cuda_latency_ms=%.2f bytes=%llu verified=%s\n", static_cast<double>(dur),
+    std::printf("result: remote_to_cuda_latency_ms=%.2f bytes=%llu verified=%s\n", dur,
                 static_cast<unsigned long long>(size), vr.ok ? "yes" : "NO");
     std::fflush(stdout);
-}
-
-void bench_multiprocess_fabric(const BenchConfig& cfg) {
-    print_config("MULTI-PROCESS FABRIC (3 real node processes + coordinator)", cfg, cfg.object_size);
-    // Launched via the CLI; in-process verification is provided by the
-    // integration tests. Here we report the design intent.
-    std::printf(
-        "result: covered by `context-fabric fabric local --nodes 3` and the multi-process integration test\n");
-    std::fflush(stdout);
+    return vr.ok;
 }
 
 }  // namespace ctf

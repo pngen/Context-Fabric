@@ -4,6 +4,7 @@
 // If no coordinator is given, starts an in-process coordinator + 3 nodes.
 
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <memory>
 
@@ -18,26 +19,29 @@ using namespace ctf;
 int main(int argc, char** argv) {
     std::string host = "127.0.0.1";
     uint16_t port = 0;
-    if (argc > 1) {
-        std::string c = argv[1];
-        auto colon = c.rfind(':');
-        if (colon != std::string::npos) {
-            host = c.substr(0, colon);
-            port = static_cast<uint16_t>(std::atoi(c.substr(colon + 1).c_str()));
-        }
+    if (argc > 2) {
+        std::fprintf(stderr, "usage: example_local_multi_node [coordinator_host:port]\n");
+        return 2;
+    }
+    if (argc == 2 && !parse_example_endpoint(argv[1], host, port)) {
+        std::fprintf(stderr, "error: coordinator must be a valid host:port\n");
+        return 2;
     }
 
-    std::unique_ptr<Coordinator> coord;
+    std::unique_ptr<ExampleTempDirectory> workspace;
     std::unique_ptr<Telemetry> coord_t;
+    std::unique_ptr<Coordinator> coord;
     std::vector<std::unique_ptr<Telemetry>> node_ts;
     std::vector<std::unique_ptr<NodeRuntime>> nodes;
+    try {
     if (port == 0) {
+        workspace = std::make_unique<ExampleTempDirectory>("multi-node");
         coord_t = std::make_unique<Telemetry>();
         coord_t->set_stderr_enabled(false);
         Coordinator::Config cc;
         cc.bind_host = "127.0.0.1";
         cc.control_port = 0;
-        cc.store_path = (std::filesystem::temp_directory_path() / "cf-multinode-coord.store").string();
+        cc.store_path = (workspace->path() / "coordinator.store").string();
         cc.telemetry_path = "";
         coord = std::make_unique<Coordinator>(cc, *coord_t);
         if (!coord->start()) return 1;
@@ -86,6 +90,12 @@ int main(int argc, char** argv) {
     for (uint64_t r : ir.replica_nodes) std::printf(" %llu", static_cast<unsigned long long>(r));
     std::printf("\n");
     std::fflush(stdout);
+    bool found_replica = false;
+    for (uint64_t replica : ir.replica_nodes) found_replica = found_replica || replica == b;
+    if (!found_replica) {
+        std::fprintf(stderr, "replica was not recorded on node-b\n");
+        return 1;
+    }
 
     // Explicit, deterministic teardown.
     for (auto& n : nodes) {
@@ -101,4 +111,8 @@ int main(int argc, char** argv) {
         coord.reset();
     }
     return 0;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "example error: %s\n", e.what());
+        return 1;
+    }
 }

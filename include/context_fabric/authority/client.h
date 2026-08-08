@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -20,8 +22,8 @@ namespace ctf {
 //
 // Used by the CLI, the public API, benchmarks, and tests. Every call is
 // request/response with a unique request id; the response is type-checked and
-// its request id must match. Retries of mutating calls are idempotent at the
-// coordinator (request-id cache).
+// its request id must match. Exact duplicates on the same live connection are
+// suppressed by the coordinator's connection-scoped request-id cache.
 // ---------------------------------------------------------------------------
 class ClientSession {
 public:
@@ -33,17 +35,21 @@ public:
 
     bool connect(const std::string& host, uint16_t port, uint64_t timeout_ms = 10000);
     void close();
-    [[nodiscard]] bool connected() const noexcept { return conn_ && conn_->is_open(); }
+    [[nodiscard]] bool connected() const noexcept;
 
     void set_timeouts(uint64_t read_ms, uint64_t write_ms);
+    [[nodiscard]] uint64_t read_timeout_ms() const noexcept { return read_timeout_ms_; }
+    [[nodiscard]] uint64_t write_timeout_ms() const noexcept { return write_timeout_ms_; }
     [[nodiscard]] uint32_t coordinator_epoch() const noexcept { return epoch_; }
-    [[nodiscard]] uint64_t next_request_id() noexcept { return ++req_seq_; }
+    [[nodiscard]] uint64_t next_request_id() noexcept {
+        return req_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
 
     // Low-level: send a request and receive the matching response.
     RpcResult call(MessageType req_type, MessageType resp_type, const std::vector<uint8_t>& payload,
                    std::vector<uint8_t>& resp_payload);
 
-    // Low-level with an explicit request id (used to test idempotent replay).
+    // Low-level with an explicit request id (used to test same-connection replay).
     RpcResult send_request_with_id(MessageType req_type, MessageType resp_type,
                                    const std::vector<uint8_t>& payload, std::vector<uint8_t>& resp_payload,
                                    uint64_t request_id);
@@ -84,7 +90,8 @@ public:
 
 private:
     std::unique_ptr<TransportConnection> conn_;
-    uint64_t req_seq_ = 1;
+    std::atomic<uint64_t> req_seq_{1};
+    mutable std::mutex rpc_mutex_;
     uint64_t read_timeout_ms_ = 30000;
     uint64_t write_timeout_ms_ = 30000;
     uint32_t epoch_ = 0;

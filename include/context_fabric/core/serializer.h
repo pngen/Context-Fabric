@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -7,6 +8,10 @@
 #include "context_fabric/core/error.h"
 
 namespace ctf {
+
+// Checked conversion for u32 count/length fields used by protocol and
+// persistence encoders. Never silently truncates a host container size.
+[[nodiscard]] uint32_t checked_u32_size(size_t size, const char* field);
 
 // ---------------------------------------------------------------------------
 // Deterministic binary writer. All integers are big-endian on the wire, so
@@ -25,7 +30,7 @@ public:
     void i64(int64_t v);
     void f64(double v);
     void bytes(const uint8_t* p, size_t n);
-    void str(const std::string& s);                     // u32 len + utf-8 bytes
+    void str(const std::string& s);                     // u32 length + opaque string bytes
     void str_vector(const std::vector<std::string>& v); // u32 count + strs
     void raw(const std::vector<uint8_t>& v) { append(v.data(), v.size()); }
 
@@ -43,7 +48,12 @@ private:
 // ---------------------------------------------------------------------------
 class Reader {
 public:
-    Reader(const uint8_t* data, size_t len) : p_(data), end_(data + len) {}
+    Reader(const uint8_t* data, size_t len)
+        : p_(data != nullptr ? data : &empty_), end_(data != nullptr ? data + len : &empty_) {
+        if (data == nullptr && len != 0) {
+            throw_error(ErrKind::Protocol, "null serialized buffer with nonzero length");
+        }
+    }
 
     uint8_t u8();
     uint16_t u16();
@@ -62,6 +72,7 @@ public:
     }
 
 private:
+    inline static constexpr uint8_t empty_ = 0;
     const uint8_t* p_;
     const uint8_t* end_;
 

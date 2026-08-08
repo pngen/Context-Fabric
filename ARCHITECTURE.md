@@ -160,26 +160,28 @@ offset  size  field
   `InstructVerify`, `InstructAbort`, `InstructPromote`, `InstructDispose`,
   `InstructShutdown`.
 - Data plane (node <-> node, client -> node): `DataBlock` / `DataBlockAck`
-  chunked transfer with stop-and-wait acks and end-to-end CRC/SHA verification.
+  chunked transfer with stop-and-wait acks and end-to-end CRC-32C plus a
+  64-bit SHA-256 fingerprint.
 
 ### 4.3 Idempotency
 
 Mutating requests carry a request id. The coordinator caches responses for the
-last 4096 `(conn, request_id)` pairs; a retry with the same request id is
-served from the cache and never re-executed. This makes retries of
-replicate/persist/migrate/delete/create idempotent.
+last 4096 `(connection, request_id)` pairs; a duplicate on that same live TCP
+connection is served from the cache and is not re-executed. Connection identity
+is not stable across reconnects, so a request retried after a lost connection
+is not deduplicated by this cache.
 
 ## 5. Data plane and transfers
 
 A transfer is a stop-and-wait stream of `DataBlock` frames. Each block carries
 the op token, object identity, generation, sequence, total count, total byte
-size, and the expected end-to-end CRC/SHA. The receiver:
+size, and the expected end-to-end CRC-32C/SHA-256 fingerprint. The receiver:
 1. reads the first block and waits (bounded) for the pending-receive
    registration;
 2. verifies identity, then the capacity bound;
 3. accumulates bytes, detects out-of-order or duplicate blocks;
-4. on completion computes the full CRC-32C + SHA-256 and compares against the
-   expected values;
+4. on completion computes CRC-32C plus the first 64 bits of SHA-256 and
+   compares both against the expected values;
 5. only on success stores the copy and reports `DataResult(ok)` to the
    coordinator;
 6. never publishes a corrupted copy.
@@ -207,7 +209,8 @@ replica does not already exist there. It sends `InstructRecv` (role
 `Replica`) to the target and `InstructSend` to the source. The source sends
 real bytes; the target verifies and stores; the coordinator commits by adding
 the target to `replicas` and returning to `Available`. Retries are
-idempotent (same request id) or rejected (`AlreadyExists`).
+deduplicated only when replayed with the same request id on the same live
+connection, or otherwise rejected (`AlreadyExists`).
 
 ### 6.3 Migrate
 
@@ -346,7 +349,8 @@ executes model recomputation itself; it plans.
 `storage/flashtier_adapter.h` defines the narrow interface a node would use to
 delegate node-local physical residency to FlashTier (VRAM / pinned host RAM /
 NVMe). Context Fabric builds and runs without FlashTier; the default factory
-returns nullptr. A sibling repository may supply a concrete implementation.
+returns `nullptr`. No concrete adapter is wired in this repository, and
+requesting `CONTEXT_FABRIC_ENABLE_FLASHTIER=ON` fails during configuration.
 
 ## 14. Shutdown
 
@@ -361,12 +365,12 @@ No detached threads; every thread is owned and joined.
 The test suite uses a lightweight project-owned harness. Tests cover object
 identity, generations, metadata serialization, compatibility, state
 transitions (including illegal ones), coordinator epochs, node registration,
-leases (acquire/renew/expire/conflict/stale), ownership transfer,
+leases (acquire/release/expire/conflict/stale), ownership transfer,
 replication, invalidation, migration and migration failure, persistence,
 corruption detection, lineage, deduplication safety, namespace isolation,
 placement determinism, transfer/recompute decisions, protocol framing,
-partial I/O, malformed frames, idempotent retries, capacity enforcement, node
+partial I/O, malformed frames, same-connection duplicate requests, capacity enforcement, node
 disconnect, node restart, coordinator restart, telemetry schema, graceful
-shutdown, and the CUDA backend. The primary distributed proof is the
-multi-process integration test and the `fabric local` launcher, which run real
-coordinator + node OS processes over real TCP.
+shutdown, and the CUDA backend. A bounded CTest invokes the `fabric local`
+launcher, which runs a real coordinator and node OS processes over TCP; the
+remaining integration tests use in-process runtime instances over real TCP.

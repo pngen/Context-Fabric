@@ -5,6 +5,7 @@
 #include <random>
 
 #include "context_fabric/core/error.h"
+#include "context_fabric/core/serializer.h"
 
 namespace ctf {
 
@@ -34,11 +35,15 @@ uint64_t stable_hash64_str(const std::string& s) noexcept {
 }
 
 ObjectId ObjectId::deterministic(const std::string& namespace_name, const std::string& name) {
-    std::string canonical = namespace_name;
-    canonical.push_back('@');
-    canonical += name;
-    uint64_t h = stable_hash64_str(canonical);
-    return ObjectId(h, stable_hash64_str(canonical + "|cf"));
+    // Length-prefix each component so delimiters inside either string cannot
+    // alias another (namespace, name) pair.
+    Writer canonical;
+    canonical.str(namespace_name);
+    canonical.str(name);
+    const uint64_t hi = stable_hash64(canonical.data().data(), canonical.data().size());
+    canonical.u8(0xCF);
+    const uint64_t lo = stable_hash64(canonical.data().data(), canonical.data().size());
+    return ObjectId(hi, lo);
 }
 
 ObjectId ObjectId::random() {

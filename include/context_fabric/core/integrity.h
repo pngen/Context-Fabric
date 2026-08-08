@@ -13,15 +13,15 @@ namespace ctf {
 // Integrity primitives.
 //  - crc32c: CRC-32C (castagnoli), accelerated with SSE4.2 on x86 when
 //    available; used as the fast streaming checksum at every boundary.
-//  - sha256: full SHA-256 for strong full verification; the public IntegrityId
-//    exposes the first 8 bytes as a fingerprint.
+//  - sha256: the primitive computes full SHA-256, while IntegrityId stores and
+//    compares only the first 8 bytes as a corruption-detection fingerprint.
 // Content generation is deterministic and seeded (see prng.h).
 // ---------------------------------------------------------------------------
 class Crc32C {
 public:
     Crc32C() = default;
     void update(const void* data, size_t len);
-    [[nodiscard]] uint32_t value() const noexcept { return crc_; }
+    [[nodiscard]] uint32_t value() const noexcept { return crc_ ^ 0xFFFFFFFFu; }
     static uint32_t compute(const void* data, size_t len);
 
 private:
@@ -33,7 +33,7 @@ public:
     Sha256() = default;
     void update(const void* data, size_t len);
     std::array<uint8_t, 32> finalize();
-    [[nodiscard]] uint64_t fingerprint() const;   // first 8 bytes of digest
+    [[nodiscard]] uint64_t fingerprint() const;   // first 8 bytes of a finalized snapshot
     static std::array<uint8_t, 32> compute(const void* data, size_t len);
 
 private:

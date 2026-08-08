@@ -16,8 +16,11 @@ ObjectId read_object_id(Reader& r) {
 }  // namespace
 
 void serialize_lineage(const std::vector<LineageEntry>& lineage, std::vector<uint8_t>& out) {
+    if (lineage.size() > 100000 || lineage.size() > 0xFFFFFFFFull) {
+        throw_error(ErrKind::Capacity, "lineage entry count too large");
+    }
     Writer w;
-    w.u32(static_cast<uint32_t>(lineage.size()));
+    w.u32(checked_u32_size(lineage.size(), "lineage entry count"));
     for (const auto& e : lineage) {
         w.u64(e.object.hi());
         w.u64(e.object.lo());
@@ -42,6 +45,9 @@ std::vector<LineageEntry> deserialize_lineage(const uint8_t* data, size_t len) {
         LineageEntry e;
         e.object = read_object_id(r);
         e.generation = Generation::from_value(r.u64());
+        if (!e.object.valid() || !e.generation.valid()) {
+            throw_error(ErrKind::Protocol, "invalid lineage identity");
+        }
         e.parent = read_object_id(r);
         e.operation = r.str();
         e.producer = r.str();
@@ -49,6 +55,7 @@ std::vector<LineageEntry> deserialize_lineage(const uint8_t* data, size_t len) {
         e.created_unix_ms = r.u64();
         v.push_back(std::move(e));
     }
+    if (!r.at_end()) throw_error(ErrKind::Protocol, "trailing bytes after lineage");
     return v;
 }
 

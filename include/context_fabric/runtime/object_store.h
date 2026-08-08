@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -48,17 +49,22 @@ public:
 
     // Retain a device allocation as an accelerator-resident copy.
     void retain_accelerator(const ObjectId& id, const Generation& gen, CopyRole role,
-                            uint8_t* device, uint64_t size);
+                            uint8_t* device, uint64_t size, const IntegrityId& integrity);
 
     // Read bytes for a transfer from whatever backend holds the copy.
     std::vector<uint8_t> read(const ObjectId& id, const Generation& gen) const;
 
     // Verify a resident copy against the store's recorded integrity.
-    void verify(const ObjectId& id, const Generation& gen, uint64_t expected_crc, uint64_t expected_sha);
+    void verify(const ObjectId& id, const Generation& gen, uint64_t expected_crc, uint64_t expected_sha,
+                bool deep = true, uint64_t expected_bytes = 0);
 
     void set_role(const ObjectId& id, const Generation& gen, CopyRole role);
     void remove(const ObjectId& id, const Generation& gen);
     void remove_domain(const ObjectId& id, const Generation& gen, StorageDomain domain);
+
+    // Forget backend associations during runtime teardown. Accelerator
+    // allocations are released; persistent records are deliberately retained.
+    void reset();
 
     [[nodiscard]] bool has_copy(const ObjectId& id, const Generation& gen) const;
     [[nodiscard]] bool has_role(const ObjectId& id, const Generation& gen, CopyRole role) const;
@@ -72,7 +78,8 @@ public:
 
 private:
     mutable std::mutex mutex_;
-    std::unordered_map<CopyKey, LocalCopy> copies_;
+    using DomainCopies = std::map<StorageDomain, LocalCopy>;
+    std::unordered_map<CopyKey, DomainCopies> copies_;
     std::unordered_map<CopyKey, AccelResidency> accelerator_resident_;
     HostMemoryBackend* host_ = nullptr;
     LocalPersistentBackend* persistent_ = nullptr;

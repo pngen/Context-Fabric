@@ -12,12 +12,18 @@ option(CONTEXT_FABRIC_BUILD_TESTS      "Build Context Fabric native tests"      
 option(CONTEXT_FABRIC_BUILD_BENCHMARKS "Build Context Fabric benchmarks"             OFF)
 option(CONTEXT_FABRIC_BUILD_EXAMPLES   "Build Context Fabric examples"               ON)
 option(CONTEXT_FABRIC_BUILD_CLI        "Build the context-fabric CLI"                ON)
-option(CONTEXT_FABRIC_ENABLE_CUDA      "Enable the CUDA accelerator backend"         ON)
+option(CONTEXT_FABRIC_ENABLE_CUDA      "Enable the CUDA accelerator backend (requires a usable toolkit/compiler)" OFF)
 option(CONTEXT_FABRIC_ENABLE_FLASHTIER "Enable the optional FlashTier adapter"       OFF)
 option(CONTEXT_FABRIC_WARNINGS_AS_ERRORS "Treat project-owned compiler warnings as errors" ON)
 
 set(CONTEXT_FABRIC_FLASHTIER_DIR "" CACHE PATH
-    "Path to a sibling FlashTier repository to enable the node-local residency adapter")
+    "Reserved path for a future sibling FlashTier integration")
+
+if(CONTEXT_FABRIC_ENABLE_FLASHTIER)
+  message(FATAL_ERROR
+    "CONTEXT_FABRIC_ENABLE_FLASHTIER=ON is not supported: this repository currently provides "
+    "only the adapter boundary and has no concrete FlashTier integration.")
+endif()
 
 # ---------------------------------------------------------------------------
 # Toolchain / standards
@@ -31,20 +37,17 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ---------------------------------------------------------------------------
 set(CONTEXT_FABRIC_HAS_CUDA OFF)
 if(CONTEXT_FABRIC_ENABLE_CUDA)
-  find_package(CUDAToolkit QUIET)
-  if(CUDAToolkit_FOUND)
-    set(CONTEXT_FABRIC_HAS_CUDA ON)
-    enable_language(CUDA)
-    set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-    # Default to sm_120 (RTX 50-series / Blackwell). Override for other GPUs,
-    # e.g. -DCONTEXT_FABRIC_CUDA_ARCHS=90 or "75;89".
-    set(CONTEXT_FABRIC_CUDA_ARCHS "120" CACHE STRING "CUDA architectures to compile for")
-    set(CMAKE_CUDA_ARCHITECTURES ${CONTEXT_FABRIC_CUDA_ARCHS})
-    message(STATUS "Context Fabric: CUDA toolkit found (${CUDAToolkit_VERSION}), archs=${CMAKE_CUDA_ARCHITECTURES}")
-  else()
-    message(STATUS "Context Fabric: CUDA requested but toolkit not found; building CPU-only")
-  endif()
+  find_package(CUDAToolkit REQUIRED)
+  set(CONTEXT_FABRIC_HAS_CUDA ON)
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  # Match the build host by default instead of silently targeting nvcc's
+  # legacy compiler default. Release artifacts should set an explicit
+  # deployment list, e.g. 90 or "89;90;120".
+  set(CONTEXT_FABRIC_CUDA_ARCHS "native" CACHE STRING "CUDA architectures to compile for")
+  set(CMAKE_CUDA_ARCHITECTURES ${CONTEXT_FABRIC_CUDA_ARCHS})
+  message(STATUS "Context Fabric: CUDA toolkit found (${CUDAToolkit_VERSION}), archs=${CMAKE_CUDA_ARCHITECTURES}")
 else()
   message(STATUS "Context Fabric: CUDA disabled by configuration; building CPU-only")
 endif()

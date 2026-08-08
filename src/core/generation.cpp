@@ -6,6 +6,12 @@
 
 namespace ctf {
 
+Generation Generation::next() const {
+    if (value_ == 0) throw_error(ErrKind::State, "cannot advance an invalid generation");
+    if (value_ == UINT64_MAX) throw_error(ErrKind::Capacity, "generation counter exhausted");
+    return Generation(value_ + 1);
+}
+
 Generation Generation::from_hex(const std::string& hex) {
     if (hex.empty() || hex.size() > 16) {
         throw_error(ErrKind::InvalidArgument, "invalid generation hex");

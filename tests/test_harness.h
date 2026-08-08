@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdio>
+#include <exception>
 #include <functional>
 #include <string>
 #include <vector>
@@ -72,20 +73,23 @@ inline int& checks() {
     do {                                                                                                        \
         ++::ctf_test::checks();                                                                                 \
         bool caught = false;                                                                                    \
+        bool failure_reported = false;                                                                          \
         try {                                                                                                   \
             (void)(expr);                                                                                       \
         } catch (const ctf::CfError& e) {                                                                       \
             caught = (e.kind() == (ekind));                                                                     \
             if (!caught) {                                                                                      \
                 ++::ctf_test::failures();                                                                       \
+                failure_reported = true;                                                                        \
                 std::printf("    FAIL %s:%d: threw wrong kind %s\n", __FILE__, __LINE__,                        \
                             ctf::err_kind_name(e.kind()));                                                      \
             }                                                                                                   \
         } catch (...) {                                                                                         \
             ++::ctf_test::failures();                                                                           \
+            failure_reported = true;                                                                            \
             std::printf("    FAIL %s:%d: threw non-CfError\n", __FILE__, __LINE__);                             \
         }                                                                                                       \
-        if (!caught) {                                                                                          \
+        if (!caught && !failure_reported) {                                                                     \
             ++::ctf_test::failures();                                                                           \
             std::printf("    FAIL %s:%d: expected throw of %s\n", __FILE__, __LINE__,                           \
                         ctf::err_kind_name(ekind));                                                             \
@@ -138,5 +142,9 @@ inline int& checks() {
         }                                                                                          \
         std::printf("\n%d tests run, %d checks, %d failures\n", run, ::ctf_test::checks(),         \
                     ::ctf_test::failures());                                                       \
+        if (!filter.empty() && run == 0) {                                                        \
+            std::printf("no tests matched the requested filters\n");                            \
+            return 2;                                                                            \
+        }                                                                                         \
         return ::ctf_test::failures() == 0 ? 0 : 1;                                                \
     }

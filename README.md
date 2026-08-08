@@ -68,11 +68,12 @@ model-specific adapters sit *above* the core abstractions.
   and only then is the old copy demoted or released. A failed migration never
   destroys the last valid authoritative copy.
 - **Persistence** — versioned, checksummed on-disk records with atomic
-  commit; torn, truncated, or corrupt records are detected and quarantined,
-  never silently accepted.
-- **Integrity** — CRC-32C (streaming) plus SHA-256 at important boundaries.
-  Every transfer, replication, migration, persistence, restoration, and CUDA
-  round-trip is verified.
+  commit; torn, truncated, or accidentally corrupted records with mismatched
+  checksums are detected and quarantined.
+- **Integrity** — CRC-32C plus the first 64 bits of SHA-256 at important
+  boundaries. Transfers, replication, migration, persistence, restoration,
+  and CUDA round trips compare both values. These are unkeyed corruption
+  checks, not authentication against a malicious writer.
 - **Placement** — a deterministic engine (baseline and cost-aware policies)
   with stable tie-breaking; every decision records its inputs and reason.
 - **Transfer vs recompute** — a planner that chooses between shipping state
@@ -93,7 +94,7 @@ model-specific adapters sit *above* the core abstractions.
               |             |             |
         +-----+-----+ +-----+-----+ +-----+-----+
         |  Node A   | |  Node B   | |  Node C   |
-        |  RTX 5090 | |  host+ssd | |  host+ssd |
+        | CUDA GPU  | |  host+ssd | |  host+ssd |
         |  CUDA     | |  HostMem  | |  HostMem  |
         |  HostMem  | |  Persist  | |  Persist  |
         +-----------+ +-----------+ +-----------+
@@ -109,8 +110,9 @@ interfaces on a cluster.
 
 ```
 context-fabric         # CLI
-context-fabric fabric local --nodes 3 --cuda-node   # real multi-process fabric
-context-fabric benchmark --quick --cuda            # benchmark suite via CLI
+context-fabric fabric local --nodes 3               # real CPU multi-process fabric
+context-fabric benchmark --quick                    # benchmark suite via CLI
+# Add --cuda-node / --cuda only on a CUDA build with a usable device.
 ctest --preset ...                                  # native tests
 ```
 
@@ -127,8 +129,10 @@ cd Context-Fabric
 cmake --preset cpu-release
 cmake --build build/cpu-release
 
-# CUDA-enabled (defaults to sm_120 for RTX 50-series; override for other GPUs)
-cmake --preset cuda-release -DCONTEXT_FABRIC_CUDA_ARCHS=90
+# CUDA-enabled (native build-host architecture by default)
+cmake --preset cuda-release
+# For a release artifact, set the deployment architectures explicitly:
+cmake --preset cuda-release -DCONTEXT_FABRIC_CUDA_ARCHS="89;90;120"
 cmake --build build/cuda-release
 ```
 
@@ -136,14 +140,15 @@ Configuration options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `CONTEXT_FABRIC_ENABLE_CUDA` | ON | Enable the CUDA accelerator backend |
-| `CONTEXT_FABRIC_CUDA_ARCHS` | `120` | CUDA architectures to compile for |
+| `CONTEXT_FABRIC_ENABLE_CUDA` | OFF | Enable CUDA; explicit `ON` requires a usable toolkit/compiler |
+| `CONTEXT_FABRIC_CUDA_ARCHS` | `native` | CUDA architectures to compile for; set an explicit deployment list for distributable artifacts |
 | `CONTEXT_FABRIC_BUILD_TESTS` | ON | Build native tests |
 | `CONTEXT_FABRIC_BUILD_BENCHMARKS` | OFF | Build the benchmark suite |
 | `CONTEXT_FABRIC_BUILD_EXAMPLES` | ON | Build runnable examples |
 | `CONTEXT_FABRIC_BUILD_CLI` | ON | Build the `context-fabric` CLI |
 | `CONTEXT_FABRIC_WARNINGS_AS_ERRORS` | ON | Warnings-as-errors for release validation |
-| `CONTEXT_FABRIC_FLASHTIER_DIR` | (empty) | Optional sibling FlashTier adapter |
+| `CONTEXT_FABRIC_ENABLE_FLASHTIER` | OFF | Reserved; `ON` fails because no concrete adapter is wired |
+| `CONTEXT_FABRIC_FLASHTIER_DIR` | (empty) | Reserved path for a future FlashTier integration |
 
 ## Test
 
@@ -165,6 +170,9 @@ context-fabric node --coordinator 127.0.0.1:9000 --id node-a --store ./node-a --
 context-fabric node --coordinator 127.0.0.1:9000 --id node-b --store ./node-b --host-cap 4GiB
 ```
 
+When `--store` is present without `--persist-cap`, the CLI uses a 1 GiB local
+persistent-store budget. Set `--persist-cap` explicitly for other budgets.
+
 Or let the launcher manage a complete multi-process fabric:
 
 ```sh
@@ -181,8 +189,8 @@ context-fabric replicate --coordinator 127.0.0.1:9000 --id <id> --to node-b
 context-fabric migrate  --coordinator 127.0.0.1:9000 --id <id> --to node-b
 context-fabric persist   --coordinator 127.0.0.1:9000 --id <id>
 context-fabric verify    --coordinator 127.0.0.1:9000 --id <id> --deep
-context-fabric decide    --coordinator 127.0.0.1:9000 --id <id> --current node-a \
-    --target node-b --recompute-sec 30
+context-fabric decide    --coordinator 127.0.0.1:9000 --namespace app --name weights \
+    --size 1GiB --current node-a --target node-b --recompute-sec 30
 ```
 
 ## Benchmark
@@ -193,9 +201,6 @@ context-fabric benchmark --quick
 
 # Full run with CUDA round-trip and CUDA remote path benchmarks
 context-fabric benchmark --cuda
-
-# Against a running fabric
-context-fabric benchmark --coordinator 127.0.0.1:9000 --cuda
 
 # Standalone runner (built when CONTEXT_FABRIC_BUILD_BENCHMARKS=ON)
 context_fabric_bench --quick
@@ -214,17 +219,17 @@ See `BENCHMARKS.md` for methodology and reporting rules.
 
 The CUDA backend enumerates devices at runtime, reports capability and memory,
 allocates on a private stream, performs host<->device transfers, and verifies
-round-trip integrity (including a device-native checksum kernel). The primary
-validation machine is an NVIDIA GeForce RTX 5090 (compute capability 12.0,
-32 GiB). The CPU-only build needs no CUDA toolkit.
+round-trip integrity (including a device-native checksum kernel). CUDA tests
+and `benchmark --cuda` require a real usable device; CPU-only builds need no
+CUDA toolkit.
 
 ## FlashTier relationship
 
 Context Fabric is a sibling project one abstraction above FlashTier. A narrow
-optional adapter interface (`storage/flashtier_adapter.h`) lets a node delegate
-node-local physical residency management to FlashTier. Context Fabric builds
-and runs completely without FlashTier; no FlashTier source is copied here.
-See `ARCHITECTURE.md` for the exact boundary.
+interface in `storage/flashtier_adapter.h` documents the intended boundary,
+but this repository does not wire a concrete adapter. Context Fabric builds
+and runs without FlashTier; requesting the unwired integration fails at CMake
+configure time. See `ARCHITECTURE.md` for the exact boundary.
 
 ## Current limitations
 
@@ -234,7 +239,12 @@ See `ARCHITECTURE.md` for the exact boundary.
   replace it without changing ContextObject semantics.
 - Validation runs on one physical machine using multiple real processes over
   localhost TCP. Multi-host validation is not yet performed.
-- RDMA, GPUDirect, CXL, object-store backends, and hm HIP/Level Zero/Metal
+- Numeric IPv4 connection deadlines include address handling on every
+  platform, and Windows hostname lookup uses the same caller deadline. POSIX
+  hostname lookup uses the system `getaddrinfo` deadline; deployments that
+  require a strict end-to-end connect bound should configure numeric IPv4
+  endpoints.
+- RDMA, GPUDirect, CXL, object-store backends, and HIP/Level Zero/Metal
   backends are future work, not current features.
 - No authentication/encryption is implemented; the trust model is an explicit
   trusted-cluster network.

@@ -1,7 +1,10 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include "context_fabric/storage/accelerator_backend.h"
 
@@ -16,7 +19,7 @@ namespace ctf {
 // ---------------------------------------------------------------------------
 class CudaAcceleratorBackend : public AcceleratorBackend {
 public:
-    explicit CudaAcceleratorBackend(uint64_t host_capacity_bytes);
+    explicit CudaAcceleratorBackend(uint64_t accelerator_capacity_bytes);
     ~CudaAcceleratorBackend() override;
 
     CudaAcceleratorBackend(const CudaAcceleratorBackend&) = delete;
@@ -46,12 +49,18 @@ public:
     void shutdown() override;
 
 private:
+    void select_device_for_thread_locked();
+    void require_allocation_locked(const uint8_t* ptr, uint64_t size, const char* operation) const;
+
+    mutable std::mutex mutex_;
+    std::unordered_map<uint8_t*, uint64_t> allocations_;
     void* stream_ = nullptr;  // cudaStream_t
     int device_ = 0;
-    uint64_t capacity_ = 0;
-    uint64_t used_ = 0;
-    uint64_t high_water_ = 0;
-    bool available_ = false;
+    uint64_t configured_capacity_ = 0;
+    std::atomic<uint64_t> capacity_{0};
+    std::atomic<uint64_t> used_{0};
+    std::atomic<uint64_t> high_water_{0};
+    std::atomic<bool> available_{false};
     bool shutdown_ = false;
 };
 

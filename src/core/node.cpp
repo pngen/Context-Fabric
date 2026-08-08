@@ -1,7 +1,6 @@
 #include "context_fabric/core/node.h"
 
 #include <cstdio>
-#include <cstring>
 
 #include "context_fabric/core/object_id.h"
 
@@ -23,9 +22,9 @@ std::string NodeId::to_string() const {
 }
 
 std::string NodeAddress::to_string() const {
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%s:%u", host.c_str(), static_cast<unsigned>(port));
-    return std::string(buf);
+    const bool already_bracketed = host.size() >= 2 && host.front() == '[' && host.back() == ']';
+    const bool ipv6_literal = !already_bracketed && host.find(':') != std::string::npos;
+    return (ipv6_literal ? "[" + host + "]" : host) + ":" + std::to_string(port);
 }
 
 }  // namespace ctf

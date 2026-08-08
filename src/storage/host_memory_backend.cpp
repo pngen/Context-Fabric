@@ -1,6 +1,9 @@
 #include "context_fabric/storage/host_memory_backend.h"
 
 #include <algorithm>
+#include <limits>
+#include <new>
+#include <stdexcept>
 
 #include "context_fabric/core/error.h"
 #include "context_fabric/core/integrity.h"
@@ -24,22 +27,44 @@ uint64_t HostMemoryBackend::high_water_bytes() const noexcept {
 }
 
 void HostMemoryBackend::put(const ObjectId& id, const Generation& gen, const uint8_t* data, uint64_t size) {
+    if (!id.valid() || !gen.valid()) {
+        throw_error(ErrKind::InvalidArgument, "host memory copy requires a valid identity");
+    }
+    if (size > static_cast<uint64_t>((std::numeric_limits<size_t>::max)())) {
+        throw_error(ErrKind::Capacity, "host memory object exceeds addressable size");
+    }
+    if (size != 0 && data == nullptr) {
+        throw_error(ErrKind::InvalidArgument, "non-empty host memory object has null data");
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     CopyKey key{id, gen};
     auto it = store_.find(key);
-    if (it != store_.end()) {
-        // Overwrite in place: adjust accounting.
-        used_ -= it->second.size();
-        it->second.assign(data, data + size);
-        used_ += size;
-    } else {
-        if (used_ + size > capacity_) {
-            throw_error(ErrKind::Capacity, "host memory capacity exceeded");
-        }
-        store_[key] = std::vector<uint8_t>(data, data + size);
-        used_ += size;
+    const uint64_t old_size = it == store_.end() ? 0 : static_cast<uint64_t>(it->second.size());
+    const uint64_t retained = used_ - old_size;
+    if (size > capacity_ - retained) {
+        throw_error(ErrKind::Capacity, "host memory capacity exceeded");
     }
-    high_water_ = std::max(high_water_, used_);
+
+    // Construct before changing either the resident value or accounting, so
+    // allocation failure leaves the old copy and counters intact.
+    try {
+        std::vector<uint8_t> replacement;
+        if (size != 0) {
+            replacement.assign(data, data + static_cast<size_t>(size));
+        }
+        if (it != store_.end()) {
+            it->second = std::move(replacement);
+        } else {
+            store_.emplace(key, std::move(replacement));
+        }
+    } catch (const std::bad_alloc&) {
+        throw_error(ErrKind::Capacity, "host memory allocation failed");
+    } catch (const std::length_error&) {
+        throw_error(ErrKind::Capacity, "host memory object exceeds addressable size");
+    }
+    used_ = retained + size;
+    high_water_ = (std::max)(high_water_, used_);
 }
 
 std::vector<uint8_t> HostMemoryBackend::get(const ObjectId& id, const Generation& gen) {

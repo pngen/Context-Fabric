@@ -1,14 +1,102 @@
 #include "context_fabric/protocol/messages.h"
 
+#include <cmath>
+#include <limits>
+
 #include "context_fabric/core/serializer.h"
 #include "context_fabric/transport/frame.h"
 
 namespace ctf {
 
+namespace {
+
+constexpr uint32_t kMaxErrKind = static_cast<uint32_t>(ErrKind::Internal);
+
+bool valid_error_kind(uint32_t value) noexcept {
+    return value <= kMaxErrKind;
+}
+
+uint8_t deserialize_bool_u8(Reader& r, const char* field) {
+    const uint8_t value = r.u8();
+    if (value > 1) {
+        throw_error(ErrKind::Protocol, std::string(field) + " must be encoded as 0 or 1", value);
+    }
+    return value;
+}
+
+void serialize_bool_u8(Writer& w, uint8_t value, const char* field) {
+    if (value > 1) {
+        throw_error(ErrKind::InvalidArgument, std::string(field) + " must be 0 or 1", value);
+    }
+    w.u8(value);
+}
+
+StorageDomain deserialize_storage_domain(Reader& r, const char* field) {
+    const uint32_t value = r.u32();
+    if (value > static_cast<uint32_t>(StorageDomain::RemotePersistent)) {
+        throw_error(ErrKind::Protocol, std::string(field) + " is not a valid storage domain", value);
+    }
+    return static_cast<StorageDomain>(value);
+}
+
+void validate_storage_domain(StorageDomain domain, const char* field) {
+    const uint32_t value = static_cast<uint32_t>(domain);
+    if (value > static_cast<uint32_t>(StorageDomain::RemotePersistent)) {
+        throw_error(ErrKind::InvalidArgument, std::string(field) + " is not a valid storage domain", value);
+    }
+}
+
+void validate_storage_domain_value(uint32_t value, const char* field, ErrKind error_kind) {
+    if (value > static_cast<uint32_t>(StorageDomain::RemotePersistent)) {
+        throw_error(error_kind, std::string(field) + " is not a valid storage domain", value);
+    }
+}
+
+void validate_copy_role_value(uint32_t value, const char* field, ErrKind error_kind) {
+    if (value > static_cast<uint32_t>(CopyRole::Transient)) {
+        throw_error(error_kind, std::string(field) + " is not a valid copy role", value);
+    }
+}
+
+void validate_lease_mode_value(uint32_t value, const char* field, ErrKind error_kind) {
+    if (value > static_cast<uint32_t>(LeaseMode::Write)) {
+        throw_error(error_kind, std::string(field) + " is not a valid lease mode", value);
+    }
+}
+
+void validate_lifecycle_value(uint32_t value, const char* field, ErrKind error_kind) {
+    if (value > static_cast<uint32_t>(LifecycleState::Released)) {
+        throw_error(error_kind, std::string(field) + " is not a valid lifecycle state", value);
+    }
+}
+
+void require_finite(double value, const char* field, ErrKind error_kind) {
+    if (!std::isfinite(value)) {
+        throw_error(error_kind, std::string(field) + " must be finite");
+    }
+}
+
+void validate_result_for_serialization(const RpcResult& result) {
+    const uint32_t error = static_cast<uint32_t>(result.err);
+    if (!valid_error_kind(error)) {
+        throw_error(ErrKind::InvalidArgument, "RPC result contains an invalid error kind", error);
+    }
+    if (result.ok) {
+        if (result.err != ErrKind::None || result.err_code != 0 || !result.message.empty()) {
+            throw_error(ErrKind::InvalidArgument, "successful RPC result contains failure fields");
+        }
+    } else if (result.err == ErrKind::None) {
+        throw_error(ErrKind::InvalidArgument, "failed RPC result has no error kind");
+    }
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // RpcResult
 // ---------------------------------------------------------------------------
 void serialize_result(Writer& w, const RpcResult& r) {
+    validate_result_for_serialization(r);
     w.u8(r.ok ? 1 : 0);
     w.u32(static_cast<uint32_t>(r.err));
     w.u64(r.err_code);
@@ -17,10 +105,21 @@ void serialize_result(Writer& w, const RpcResult& r) {
 
 RpcResult deserialize_result(Reader& r) {
     RpcResult res;
-    res.ok = r.u8() != 0;
-    res.err = static_cast<ErrKind>(r.u32());
+    res.ok = deserialize_bool_u8(r, "RPC result ok") != 0;
+    const uint32_t error = r.u32();
+    if (!valid_error_kind(error)) {
+        throw_error(ErrKind::Protocol, "RPC result contains an invalid error kind", error);
+    }
+    res.err = static_cast<ErrKind>(error);
     res.err_code = r.u64();
     res.message = r.str();
+    if (res.ok) {
+        if (res.err != ErrKind::None || res.err_code != 0 || !res.message.empty()) {
+            throw_error(ErrKind::Protocol, "successful RPC result contains failure fields");
+        }
+    } else if (res.err == ErrKind::None) {
+        throw_error(ErrKind::Protocol, "failed RPC result has no error kind");
+    }
     return res;
 }
 
@@ -44,16 +143,18 @@ ObjectId read_object_id(Reader& r) {
 }
 
 void serialize_location(Writer& w, const Location& loc) {
+    validate_storage_domain(loc.domain, "location domain");
     w.u64(loc.node_id);
     w.u32(static_cast<uint32_t>(loc.domain));
 }
 Location deserialize_location(Reader& r) {
     Location loc;
     loc.node_id = r.u64();
-    loc.domain = static_cast<StorageDomain>(r.u32());
+    loc.domain = deserialize_storage_domain(r, "location domain");
     return loc;
 }
 void serialize_lease(Writer& w, const Lease& l) {
+    validate_lease_mode_value(static_cast<uint32_t>(l.mode), "lease mode", ErrKind::InvalidArgument);
     w.u64(l.object.hi());
     w.u64(l.object.lo());
     w.u64(l.generation.value());
@@ -70,7 +171,9 @@ Lease deserialize_lease(Reader& r) {
     l.object = read_object_id(r);
     l.generation = Generation::from_value(r.u64());
     l.holder = NodeId(r.u64());
-    l.mode = static_cast<LeaseMode>(r.u32());
+    const uint32_t mode = r.u32();
+    validate_lease_mode_value(mode, "lease mode", ErrKind::Protocol);
+    l.mode = static_cast<LeaseMode>(mode);
     l.coordinator_epoch = r.u64();
     l.lease_generation = r.u64();
     l.lease_id = r.u64();
@@ -88,6 +191,12 @@ std::vector<LineageEntry> deserialize_lineage_vec(Reader& r) {
     return deserialize_lineage(buf.data(), buf.size());
 }
 void serialize_placement(Writer& w, const PlacementDecision& d) {
+    require_finite(d.score, "placement score", ErrKind::InvalidArgument);
+    require_finite(d.transfer.expected_seconds, "transfer expected seconds", ErrKind::InvalidArgument);
+    require_finite(d.transfer.expected_bytes, "transfer expected bytes", ErrKind::InvalidArgument);
+    require_finite(d.transfer.resource_cost, "transfer resource cost", ErrKind::InvalidArgument);
+    require_finite(d.recompute.expected_seconds, "recompute expected seconds", ErrKind::InvalidArgument);
+    require_finite(d.recompute.resource_cost, "recompute resource cost", ErrKind::InvalidArgument);
     serialize_location(w, d.location);
     w.f64(d.score);
     w.str(d.policy);
@@ -110,16 +219,25 @@ PlacementDecision deserialize_placement(Reader& r) {
     d.transfer.resource_cost = r.f64();
     d.recompute.expected_seconds = r.f64();
     d.recompute.resource_cost = r.f64();
-    d.chose_transfer = r.u8() != 0;
+    d.chose_transfer = deserialize_bool_u8(r, "placement chose_transfer") != 0;
+    require_finite(d.score, "placement score", ErrKind::Protocol);
+    require_finite(d.transfer.expected_seconds, "transfer expected seconds", ErrKind::Protocol);
+    require_finite(d.transfer.expected_bytes, "transfer expected bytes", ErrKind::Protocol);
+    require_finite(d.transfer.resource_cost, "transfer resource cost", ErrKind::Protocol);
+    require_finite(d.recompute.expected_seconds, "recompute expected seconds", ErrKind::Protocol);
+    require_finite(d.recompute.resource_cost, "recompute resource cost", ErrKind::Protocol);
     return d;
 }
 void serialize_u64_vec(Writer& w, const std::vector<uint64_t>& v) {
-    w.u32(static_cast<uint32_t>(v.size()));
+    if (v.size() > 1000000) throw_error(ErrKind::Capacity, "u64 vector count unreasonable");
+    w.u32(checked_u32_size(v.size(), "u64 vector count"));
     for (uint64_t x : v) w.u64(x);
 }
 std::vector<uint64_t> deserialize_u64_vec(Reader& r) {
     uint32_t n = r.u32();
-    if (n > 1000000) throw_error(ErrKind::Protocol, "u64 vector count unreasonable");
+    if (n > 1000000 || static_cast<size_t>(n) > r.remaining() / sizeof(uint64_t)) {
+        throw_error(ErrKind::Protocol, "u64 vector count unreasonable");
+    }
     std::vector<uint64_t> v;
     v.reserve(n);
     for (uint32_t i = 0; i < n; ++i) v.push_back(r.u64());
@@ -293,8 +411,10 @@ ObjectInspectReq deserialize_object_inspect(Reader& r) {
     return m;
 }
 void serialize_object_inspect_resp(Writer& w, const ObjectInspectResp& r) {
+    validate_lifecycle_value(r.lifecycle, "object lifecycle", ErrKind::InvalidArgument);
+    validate_storage_domain_value(r.authoritative_domain, "authoritative domain", ErrKind::InvalidArgument);
     serialize_result(w, r.result);
-    w.u8(r.has);
+    serialize_bool_u8(w, r.has, "object inspect has");
     std::vector<uint8_t> md;
     r.metadata.serialize(md);
     w.bytes(md.data(), md.size());
@@ -315,15 +435,17 @@ void serialize_object_inspect_resp(Writer& w, const ObjectInspectResp& r) {
 ObjectInspectResp deserialize_object_inspect_resp(Reader& r) {
     ObjectInspectResp m;
     m.result = deserialize_result(r);
-    m.has = r.u8();
+    m.has = deserialize_bool_u8(r, "object inspect has");
     std::vector<uint8_t> md = r.bytes(r.u32());
     m.metadata.deserialize(md.data(), md.size());
     m.object_id = read_object_id(r);
     m.generation = Generation::from_value(r.u64());
     m.lease_generation = r.u64();
     m.lifecycle = r.u32();
+    validate_lifecycle_value(m.lifecycle, "object lifecycle", ErrKind::Protocol);
     m.authoritative_node = r.u64();
     m.authoritative_domain = r.u32();
+    validate_storage_domain_value(m.authoritative_domain, "authoritative domain", ErrKind::Protocol);
     m.authoritative_generation = r.u64();
     m.replica_nodes = deserialize_u64_vec(r);
     m.persistent_nodes = deserialize_u64_vec(r);
@@ -343,7 +465,8 @@ ObjectListReq deserialize_object_list(Reader& r) {
 }
 void serialize_object_list_resp(Writer& w, const ObjectListResp& r) {
     serialize_result(w, r.result);
-    w.u32(static_cast<uint32_t>(r.ids.size()));
+    if (r.ids.size() > 1000000) throw_error(ErrKind::Capacity, "object list count unreasonable");
+    w.u32(checked_u32_size(r.ids.size(), "object list count"));
     for (const auto& id : r.ids) {
         w.u64(id.hi());
         w.u64(id.lo());
@@ -353,7 +476,10 @@ ObjectListResp deserialize_object_list_resp(Reader& r) {
     ObjectListResp m;
     m.result = deserialize_result(r);
     uint32_t n = r.u32();
-    if (n > 1000000) throw_error(ErrKind::Protocol, "object list count unreasonable");
+    if (n > 1000000 || static_cast<size_t>(n) > r.remaining() / (2 * sizeof(uint64_t))) {
+        throw_error(ErrKind::Protocol, "object list count unreasonable");
+    }
+    m.ids.reserve(n);
     for (uint32_t i = 0; i < n; ++i) m.ids.emplace_back(read_object_id(r));
     return m;
 }
@@ -386,7 +512,7 @@ void serialize_object_delete(Writer& w, const ObjectDeleteReq& r) {
 ObjectDeleteReq deserialize_object_delete(Reader& r) {
     ObjectDeleteReq m;
     m.object_id = read_object_id(r);
-    m.force = r.u8() != 0;
+    m.force = deserialize_bool_u8(r, "object delete force") != 0;
     return m;
 }
 void serialize_object_delete_resp(Writer& w, const ObjectDeleteResp& r) {
@@ -402,6 +528,7 @@ ObjectDeleteResp deserialize_object_delete_resp(Reader& r) {
 // Leases
 // ---------------------------------------------------------------------------
 void serialize_lease_acquire(Writer& w, const LeaseAcquireReq& r) {
+    validate_lease_mode_value(r.mode, "lease acquire mode", ErrKind::InvalidArgument);
     w.u64(r.object_id.hi());
     w.u64(r.object_id.lo());
     w.u64(r.holder_node);
@@ -413,18 +540,19 @@ LeaseAcquireReq deserialize_lease_acquire(Reader& r) {
     m.object_id = read_object_id(r);
     m.holder_node = r.u64();
     m.mode = r.u32();
+    validate_lease_mode_value(m.mode, "lease acquire mode", ErrKind::Protocol);
     m.duration_ms = r.u64();
     return m;
 }
 void serialize_lease_acquire_resp(Writer& w, const LeaseAcquireResp& r) {
     serialize_result(w, r.result);
-    w.u8(r.has_lease);
+    serialize_bool_u8(w, r.has_lease, "lease response has_lease");
     serialize_lease(w, r.lease);
 }
 LeaseAcquireResp deserialize_lease_acquire_resp(Reader& r) {
     LeaseAcquireResp m;
     m.result = deserialize_result(r);
-    m.has_lease = r.u8();
+    m.has_lease = deserialize_bool_u8(r, "lease response has_lease");
     m.lease = deserialize_lease(r);
     return m;
 }
@@ -514,6 +642,7 @@ ReplicateResp deserialize_replicate_resp(Reader& r) {
 }
 
 void serialize_migrate(Writer& w, const MigrateReq& r) {
+    validate_storage_domain_value(r.target_domain, "migration target domain", ErrKind::InvalidArgument);
     w.u64(r.object_id.hi());
     w.u64(r.object_id.lo());
     w.u64(r.target_node);
@@ -525,7 +654,8 @@ MigrateReq deserialize_migrate(Reader& r) {
     m.object_id = read_object_id(r);
     m.target_node = r.u64();
     m.target_domain = r.u32();
-    m.keep_source = r.u8() != 0;
+    validate_storage_domain_value(m.target_domain, "migration target domain", ErrKind::Protocol);
+    m.keep_source = deserialize_bool_u8(r, "migration keep_source") != 0;
     return m;
 }
 void serialize_migrate_resp(Writer& w, const MigrateResp& r) {
@@ -587,13 +717,13 @@ void serialize_verify(Writer& w, const VerifyReq& r) {
     w.u64(r.object_id.hi());
     w.u64(r.object_id.lo());
     w.u64(r.on_node);
-    w.u8(r.deep);
+    serialize_bool_u8(w, r.deep, "verify deep");
 }
 VerifyReq deserialize_verify(Reader& r) {
     VerifyReq m;
     m.object_id = read_object_id(r);
     m.on_node = r.u64();
-    m.deep = r.u8();
+    m.deep = deserialize_bool_u8(r, "verify deep");
     return m;
 }
 void serialize_verify_resp(Writer& w, const VerifyResp& r) {
@@ -607,7 +737,7 @@ void serialize_verify_resp(Writer& w, const VerifyResp& r) {
 VerifyResp deserialize_verify_resp(Reader& r) {
     VerifyResp m;
     m.result = deserialize_result(r);
-    m.ok = r.u8() != 0;
+    m.ok = deserialize_bool_u8(r, "verify response ok") != 0;
     m.bytes = r.u64();
     m.crc32c = r.u64();
     m.sha = r.u64();
@@ -645,6 +775,7 @@ PlacementQueryResp deserialize_placement_query_resp(Reader& r) {
 }
 
 void serialize_decision_query(Writer& w, const DecisionQueryReq& r) {
+    require_finite(r.measured_bandwidth_bps, "measured bandwidth", ErrKind::InvalidArgument);
     std::vector<uint8_t> md;
     r.metadata.serialize(md);
     w.bytes(md.data(), md.size());
@@ -659,6 +790,7 @@ DecisionQueryReq deserialize_decision_query(Reader& r) {
     m.current_node = r.u64();
     m.target_node = r.u64();
     m.measured_bandwidth_bps = r.f64();
+    require_finite(m.measured_bandwidth_bps, "measured bandwidth", ErrKind::Protocol);
     return m;
 }
 void serialize_decision_query_resp(Writer& w, const DecisionQueryResp& r) {
@@ -686,8 +818,8 @@ void serialize_instruct_send(Writer& w, const InstructSendReq& r) {
     w.u64(r.byte_size);
     w.u64(r.crc32c);
     w.u64(r.sha);
-    w.u8(r.keep_as_replica);
-    w.u8(r.delete_after_send);
+    serialize_bool_u8(w, r.keep_as_replica, "send keep_as_replica");
+    serialize_bool_u8(w, r.delete_after_send, "send delete_after_send");
 }
 InstructSendReq deserialize_instruct_send(Reader& r) {
     InstructSendReq m;
@@ -700,11 +832,13 @@ InstructSendReq deserialize_instruct_send(Reader& r) {
     m.byte_size = r.u64();
     m.crc32c = r.u64();
     m.sha = r.u64();
-    m.keep_as_replica = r.u8();
-    m.delete_after_send = r.u8();
+    m.keep_as_replica = deserialize_bool_u8(r, "send keep_as_replica");
+    m.delete_after_send = deserialize_bool_u8(r, "send delete_after_send");
     return m;
 }
 void serialize_instruct_recv(Writer& w, const InstructRecvReq& r) {
+    validate_copy_role_value(r.role, "receive role", ErrKind::InvalidArgument);
+    validate_storage_domain_value(r.domain, "receive domain", ErrKind::InvalidArgument);
     w.u64(r.op_token);
     w.u64(r.object_id.hi());
     w.u64(r.object_id.lo());
@@ -717,7 +851,7 @@ void serialize_instruct_recv(Writer& w, const InstructRecvReq& r) {
     w.u64(r.sha);
     w.u32(r.role);
     w.u32(r.domain);
-    w.u8(r.self_load);
+    serialize_bool_u8(w, r.self_load, "receive self_load");
     std::vector<uint8_t> md;
     r.metadata.serialize(md);
     w.bytes(md.data(), md.size());
@@ -735,7 +869,9 @@ InstructRecvReq deserialize_instruct_recv(Reader& r) {
     m.sha = r.u64();
     m.role = r.u32();
     m.domain = r.u32();
-    m.self_load = r.u8();
+    validate_copy_role_value(m.role, "receive role", ErrKind::Protocol);
+    validate_storage_domain_value(m.domain, "receive domain", ErrKind::Protocol);
+    m.self_load = deserialize_bool_u8(r, "receive self_load");
     std::vector<uint8_t> md = r.bytes(r.u32());
     m.metadata.deserialize(md.data(), md.size());
     return m;
@@ -761,7 +897,7 @@ void serialize_instruct_verify(Writer& w, const InstructVerifyReq& r) {
     w.u64(r.byte_size);
     w.u64(r.crc32c);
     w.u64(r.sha);
-    w.u8(r.deep);
+    serialize_bool_u8(w, r.deep, "instruction verify deep");
 }
 InstructVerifyReq deserialize_instruct_verify(Reader& r) {
     InstructVerifyReq m;
@@ -771,7 +907,7 @@ InstructVerifyReq deserialize_instruct_verify(Reader& r) {
     m.byte_size = r.u64();
     m.crc32c = r.u64();
     m.sha = r.u64();
-    m.deep = r.u8();
+    m.deep = deserialize_bool_u8(r, "instruction verify deep");
     return m;
 }
 void serialize_instruct_promote(Writer& w, const InstructPromoteReq& r) {
@@ -790,14 +926,14 @@ void serialize_instruct_dispose(Writer& w, const InstructDisposeReq& r) {
     w.u64(r.object_id.hi());
     w.u64(r.object_id.lo());
     w.u64(r.generation.value());
-    w.u8(r.keep_as_replica);
+    serialize_bool_u8(w, r.keep_as_replica, "dispose keep_as_replica");
 }
 InstructDisposeReq deserialize_instruct_dispose(Reader& r) {
     InstructDisposeReq m;
     m.op_token = r.u64();
     m.object_id = read_object_id(r);
     m.generation = Generation::from_value(r.u64());
-    m.keep_as_replica = r.u8();
+    m.keep_as_replica = deserialize_bool_u8(r, "dispose keep_as_replica");
     return m;
 }
 void serialize_instruct_shutdown(Writer& w, const InstructShutdownReq& r) {

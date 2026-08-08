@@ -32,11 +32,11 @@ public:
     // If `path` is empty, events go to stderr only.
     void open(const std::string& path);
     void close();
-    [[nodiscard]] bool is_open() const noexcept { return opened_; }
+    [[nodiscard]] bool is_open() const;
 
-    void set_node_id(uint64_t node_id) noexcept { node_id_ = node_id; }
-    void set_coordinator_epoch(uint64_t epoch) noexcept { epoch_ = epoch; }
-    void set_stderr_enabled(bool on) noexcept { stderr_enabled_ = on; }
+    void set_node_id(uint64_t node_id);
+    void set_coordinator_epoch(uint64_t epoch);
+    void set_stderr_enabled(bool on);
 
     // Emit an event. `event` is the event type; doc() is a JSON object whose
     // fields are appended to the standard envelope.
@@ -46,7 +46,7 @@ public:
     void emit_msg(const std::string& event, const std::string& message);
 
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::string path_;
     std::ofstream file_;
     bool opened_ = false;

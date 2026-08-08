@@ -2,6 +2,7 @@
 
 #if defined(CONTEXT_FABRIC_HAS_CUDA)
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <thread>
@@ -18,14 +19,19 @@ namespace {
 
 struct CudaCoord {
     std::string store_path;
-    Coordinator coord;
     Telemetry telemetry;
+    Coordinator coord;
 
-    CudaCoord() : store_path(make_store()), coord(make_cfg(store_path), telemetry) {
+    CudaCoord() : store_path(make_store()), telemetry(), coord(make_cfg(store_path), telemetry) {
         telemetry.set_stderr_enabled(false);
         if (!coord.start()) throw CfError(ErrKind::Internal, "coordinator start failed");
     }
-    ~CudaCoord() { coord.shutdown(); }
+    ~CudaCoord() {
+        coord.shutdown();
+        std::error_code ec;
+        std::filesystem::remove(store_path, ec);
+        std::filesystem::remove(store_path + ".tmp", ec);
+    }
     static std::string make_store() {
         return (std::filesystem::temp_directory_path() / ("ctf-cudac-" + ObjectId::random().to_hex())).string() +
                ".store";
@@ -113,8 +119,7 @@ CF_TEST(cuda_device_discovery) {
     CF_CHECK(acc->device_count() >= 1);
     std::string name = acc->device_name(0);
     CF_CHECK(!name.empty());
-    // The machine under test carries an RTX 5090 (Blackwell, CC 12.0).
-    CF_CHECK(acc->device_compute_capability_major(0) == 12);
+    CF_CHECK(acc->device_compute_capability_major(0) > 0);
     CF_CHECK(acc->capacity_bytes() > 0);
     CF_CHECK(acc->used_bytes() == 0);
     acc->shutdown();
@@ -155,6 +160,91 @@ CF_TEST(cuda_capacity_bounded) {
     uint8_t* device = nullptr;
     CF_CHECK_THROWS(acc->allocate(device, acc->capacity_bytes() + 1), ErrKind::Capacity);
     acc->shutdown();
+}
+
+CF_TEST(cuda_multiple_allocations_accounted_and_owned) {
+    constexpr uint64_t capacity = 32ull * 1024 * 1024;
+    std::unique_ptr<AcceleratorBackend> acc(create_accelerator_backend(capacity));
+    CF_REQUIRE(acc && acc->available());
+    CF_CHECK(acc->capacity_bytes() > 0);
+    CF_CHECK(acc->capacity_bytes() <= capacity);
+
+    uint8_t* first = nullptr;
+    uint8_t* second = nullptr;
+    acc->allocate(first, 1024 * 1024);
+    acc->allocate(second, 2 * 1024 * 1024);
+    CF_CHECK(acc->used_bytes() == 3 * 1024 * 1024);
+    acc->free(first);
+    CF_CHECK(acc->used_bytes() == 2 * 1024 * 1024);
+    CF_CHECK_THROWS(acc->free(first), ErrKind::InvalidArgument);
+    acc->free(second);
+    CF_CHECK(acc->used_bytes() == 0);
+    acc->shutdown();
+}
+
+CF_TEST(cuda_rejects_unowned_ranges_and_null_host_buffers) {
+    std::unique_ptr<AcceleratorBackend> acc(create_accelerator_backend(32ull * 1024 * 1024));
+    CF_REQUIRE(acc && acc->available());
+    uint8_t* device = nullptr;
+    acc->allocate(device, 1024);
+    std::vector<uint8_t> host(1024, 7);
+
+    CF_CHECK_THROWS(acc->copy_h2d(device, nullptr, 1), ErrKind::InvalidArgument);
+    CF_CHECK_THROWS(acc->copy_d2h(nullptr, device, 1), ErrKind::InvalidArgument);
+    CF_CHECK_THROWS(acc->copy_h2d(device, host.data(), 1025), ErrKind::InvalidArgument);
+    CF_CHECK_THROWS(acc->copy_d2h(host.data(), device + 1, 1), ErrKind::InvalidArgument);
+
+    acc->free(device);
+    acc->shutdown();
+}
+
+CF_TEST(cuda_backend_serializes_concurrent_ownership_updates) {
+    constexpr size_t thread_count = 8;
+    constexpr uint64_t allocation_size = 1024 * 1024;
+    std::unique_ptr<AcceleratorBackend> acc(create_accelerator_backend(64ull * 1024 * 1024));
+    CF_REQUIRE(acc && acc->available());
+    std::vector<uint8_t*> pointers(thread_count, nullptr);
+    std::atomic<uint64_t> failures{0};
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < thread_count; ++i) {
+        threads.emplace_back([&, i] {
+            try {
+                acc->allocate(pointers[i], allocation_size);
+            } catch (...) {
+                failures.fetch_add(1);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    CF_REQUIRE(failures.load() == 0);
+    CF_CHECK(acc->used_bytes() == thread_count * allocation_size);
+
+    threads.clear();
+    for (size_t i = 0; i < thread_count; ++i) {
+        threads.emplace_back([&, i] {
+            try {
+                acc->free(pointers[i]);
+            } catch (...) {
+                failures.fetch_add(1);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    CF_CHECK(failures.load() == 0);
+    CF_CHECK(acc->used_bytes() == 0);
+    acc->shutdown();
+}
+
+CF_TEST(cuda_shutdown_reclaims_outstanding_allocations) {
+    std::unique_ptr<AcceleratorBackend> acc(create_accelerator_backend(32ull * 1024 * 1024));
+    CF_REQUIRE(acc && acc->available());
+    uint8_t* device = nullptr;
+    acc->allocate(device, 1024 * 1024);
+    CF_CHECK(acc->used_bytes() == 1024 * 1024);
+    acc->shutdown();
+    CF_CHECK(acc->used_bytes() == 0);
+    CF_CHECK(!acc->available());
+    CF_CHECK_NOTHROW(acc->shutdown());
 }
 
 CF_TEST(cuda_node_migrate_to_accelerator) {

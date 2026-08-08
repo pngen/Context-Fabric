@@ -1,7 +1,10 @@
 #include "test_harness.h"
 
+#include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <unordered_map>
 #include <vector>
 
 #include "context_fabric/storage/flashtier_adapter.h"
@@ -9,10 +12,79 @@
 #include "context_fabric/storage/persistent_backend.h"
 #include "context_fabric/core/integrity.h"
 #include "context_fabric/core/prng.h"
+#include "context_fabric/core/telemetry.h"
+#include "context_fabric/runtime/node_runtime.h"
+#include "context_fabric/runtime/object_store.h"
 
 using namespace ctf;
 
 namespace fs = std::filesystem;
+
+namespace {
+
+class TestAccelerator final : public AcceleratorBackend {
+public:
+    ~TestAccelerator() override { shutdown(); }
+
+    const char* name() const noexcept override { return "test-accelerator"; }
+    bool available() const noexcept override { return true; }
+    uint64_t device_count() const noexcept override { return 1; }
+    std::string device_name(uint64_t) const override { return "test-device"; }
+    uint64_t device_total_memory(uint64_t) const override { return capacity_; }
+    uint64_t device_compute_capability_major(uint64_t) const override { return 1; }
+    uint64_t device_compute_capability_minor(uint64_t) const override { return 0; }
+    uint64_t capacity_bytes() const noexcept override { return capacity_; }
+    uint64_t used_bytes() const noexcept override { return used_; }
+    uint64_t high_water_bytes() const noexcept override { return high_water_; }
+    void set_device(uint64_t index) override {
+        if (index != 0) throw_error(ErrKind::InvalidArgument, "invalid test device");
+    }
+    void allocate(uint8_t*& ptr, uint64_t size) override {
+        if (size > capacity_ - used_) throw_error(ErrKind::Capacity, "test accelerator full");
+        ptr = new uint8_t[static_cast<size_t>(size)];
+        allocations_.emplace(ptr, size);
+        used_ += size;
+        high_water_ = (std::max)(high_water_, used_);
+    }
+    void free(uint8_t* ptr) override {
+        auto it = allocations_.find(ptr);
+        if (it == allocations_.end()) throw_error(ErrKind::State, "unknown test allocation");
+        used_ -= it->second;
+        delete[] ptr;
+        allocations_.erase(it);
+    }
+    void copy_h2d(uint8_t* dst, const uint8_t* src, uint64_t size) override {
+        std::memcpy(dst, src, static_cast<size_t>(size));
+    }
+    void copy_d2h(uint8_t* dst, const uint8_t* src, uint64_t size) override {
+        std::memcpy(dst, src, static_cast<size_t>(size));
+    }
+    void verify(const uint8_t* device, uint64_t size, uint64_t crc, uint64_t sha) override {
+        const IntegrityId actual = compute_integrity(device, static_cast<size_t>(size));
+        if (actual.crc32c != crc || actual.sha != sha) {
+            throw_error(ErrKind::Integrity, "test accelerator checksum mismatch");
+        }
+    }
+    void synchronize() override {}
+    void shutdown() override {
+        for (auto& allocation : allocations_) delete[] allocation.first;
+        allocations_.clear();
+        used_ = 0;
+    }
+
+private:
+    uint64_t capacity_ = 1024 * 1024;
+    uint64_t used_ = 0;
+    uint64_t high_water_ = 0;
+    std::unordered_map<uint8_t*, uint64_t> allocations_;
+};
+
+std::string temp_store(const char* label) {
+    return (fs::temp_directory_path() /
+            (std::string("ctf-test-") + label + "-" + ObjectId::random().to_hex())).string();
+}
+
+}  // namespace
 
 CF_TEST(flashtier_adapter_absent_by_default) {
     // Context Fabric builds and runs without FlashTier; the factory returns
@@ -56,6 +128,20 @@ CF_TEST(host_memory_verify_and_missing) {
                     ErrKind::NotFound);
 }
 
+CF_TEST(host_memory_replacement_is_transactional) {
+    HostMemoryBackend host(16);
+    const ObjectId id = ObjectId::deterministic("ns", "replace");
+    const Generation gen = Generation::first();
+    const auto original = generate_content(1, 1, 8);
+    const auto too_large = generate_content(2, 2, 17);
+    host.put(id, gen, original.data(), original.size());
+    CF_CHECK_THROWS(host.put(id, gen, too_large.data(), too_large.size()), ErrKind::Capacity);
+    CF_CHECK(host.get(id, gen) == original);
+    CF_CHECK(host.used_bytes() == original.size());
+    CF_CHECK_THROWS(host.put(ObjectId(), gen, original.data(), original.size()), ErrKind::InvalidArgument);
+    CF_CHECK_THROWS(host.put(id, gen, nullptr, 1), ErrKind::InvalidArgument);
+}
+
 CF_TEST(persistent_roundtrip_verify) {
     std::string root = (fs::temp_directory_path() / ("ctf-test-persist-" + ObjectId::random().to_hex())).string();
     LocalPersistentBackend store(root, 1024 * 1024);
@@ -93,6 +179,107 @@ CF_TEST(persistent_capacity_enforced) {
     auto data = generate_content(1, 1, 2000);
     CF_CHECK_THROWS(store.put(id, Generation::first(), data.data(), data.size()), ErrKind::Capacity);
     fs::remove_all(root);
+}
+
+CF_TEST(persistent_replacement_and_external_delete_accounting) {
+    const std::string root = temp_store("persistent-accounting");
+    const ObjectId id = ObjectId::deterministic("ns", "accounted");
+    const Generation gen = Generation::first();
+    const auto first = generate_content(4, 5, 128);
+    const auto replacement = generate_content(6, 7, 256);
+    LocalPersistentBackend store(root, 1024 * 1024);
+    store.put(id, gen, first.data(), first.size());
+    const uint64_t first_accounted = store.used_bytes();
+    CF_CHECK(first_accounted > first.size());
+    store.put(id, gen, replacement.data(), replacement.size());
+    CF_CHECK(store.get(id, gen) == replacement);
+    CF_CHECK(store.used_bytes() == first_accounted + replacement.size() - first.size());
+
+    for (const auto& entry : fs::directory_iterator(fs::path(root) / "objects")) {
+        if (entry.path().extension() == ".cfobj") fs::remove(entry.path());
+    }
+    store.remove(id, gen);
+    CF_CHECK(store.used_bytes() == 0);
+    CF_CHECK(!store.contains(id, gen));
+    fs::remove_all(root);
+}
+
+CF_TEST(object_store_tracks_coherent_domains_and_releases_accelerator) {
+    const std::string root = temp_store("object-store-domains");
+    HostMemoryBackend host(1024 * 1024);
+    LocalPersistentBackend persistent(root, 1024 * 1024);
+    TestAccelerator accelerator;
+    NodeObjectStore store;
+    store.set_host(&host);
+    store.set_persistent(&persistent);
+    store.set_accelerator(&accelerator);
+
+    const ObjectId id = ObjectId::deterministic("ns", "multi-domain");
+    const Generation gen = Generation::first();
+    const auto bytes = generate_content(10, 11, 256);
+    const IntegrityId integrity = compute_integrity(bytes.data(), bytes.size());
+    ContextMetadata metadata;
+    metadata.byte_size = bytes.size();
+
+    store.store(id, gen, CopyRole::Authoritative, StorageDomain::HostMemory,
+                &metadata, bytes.data(), bytes.size());
+    store.store(id, gen, CopyRole::Persistent, StorageDomain::LocalPersistent,
+                &metadata, bytes.data(), bytes.size());
+    uint8_t* first_device = nullptr;
+    accelerator.allocate(first_device, bytes.size());
+    accelerator.copy_h2d(first_device, bytes.data(), bytes.size());
+    store.retain_accelerator(id, gen, CopyRole::Replica, first_device, bytes.size(), integrity);
+    CF_CHECK(store.host_used() == bytes.size());
+    CF_CHECK(store.persistent_used() > bytes.size());
+    CF_CHECK(store.accelerator_used() == bytes.size());
+
+    uint8_t* replacement_device = nullptr;
+    accelerator.allocate(replacement_device, bytes.size());
+    accelerator.copy_h2d(replacement_device, bytes.data(), bytes.size());
+    store.retain_accelerator(id, gen, CopyRole::Replica, replacement_device, bytes.size(), integrity);
+    CF_CHECK(store.accelerator_used() == bytes.size());
+    CF_CHECK(store.read(id, gen) == bytes);
+
+    const auto divergent = generate_content(12, 14, bytes.size());
+    CF_REQUIRE(divergent != bytes);
+    CF_CHECK_THROWS(store.store(id, gen, CopyRole::Persistent, StorageDomain::LocalPersistent,
+                                &metadata, divergent.data(), divergent.size()),
+                    ErrKind::Integrity);
+    store.remove(id, gen);
+    CF_CHECK(store.host_used() == 0);
+    CF_CHECK(store.persistent_used() == 0);
+    CF_CHECK(store.accelerator_used() == 0);
+    CF_CHECK(!store.has_copy(id, gen));
+    fs::remove_all(root);
+}
+
+CF_TEST(node_runtime_rejects_unserviceable_configs_and_restarts_cleanly) {
+    Telemetry telemetry;
+    NodeConfig invalid;
+    invalid.node_id = NodeId::deterministic("invalid-runtime");
+    invalid.coord_port = 1;
+    invalid.host_capacity = 1024;
+    invalid.transfer_workers = 0;
+    NodeRuntime invalid_runtime(invalid, telemetry);
+    CF_CHECK_THROWS(invalid_runtime.start(), ErrKind::InvalidArgument);
+
+    NodeConfig config;
+    config.node_id = NodeId::deterministic("restart-runtime");
+    config.coord_port = 1;
+    config.host_capacity = 1024 * 1024;
+    config.heartbeat_interval_ms = 60000;
+    config.op_timeout_ms = 5000;
+    config.transfer_workers = 1;
+    config.job_queue_capacity = 1;
+    NodeRuntime runtime(config, telemetry);
+    for (int iteration = 0; iteration < 5; ++iteration) {
+        const auto started = std::chrono::steady_clock::now();
+        CF_REQUIRE(runtime.start());
+        runtime.shutdown();
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        CF_CHECK(elapsed < std::chrono::seconds(2));
+        CF_CHECK(runtime.data_port() == 0);
+    }
 }
 
 CF_TEST(persistent_corruption_detected) {
@@ -162,10 +349,11 @@ CF_TEST(persistent_recover_quarantine_tmp) {
         tmp.close();
     }
     // Corrupt exactly one of the two object files.
+    const std::string bad_prefix = ObjectId::deterministic("ns", "bad").to_hex();
     bool corrupted = false;
     for (const auto& e : fs::directory_iterator(fs::path(root) / "objects")) {
         if (e.path().extension() == ".tmp") continue;
-        if (corrupted) continue;
+        if (corrupted || e.path().filename().string().rfind(bad_prefix, 0) != 0) continue;
         std::ifstream in(e.path(), std::ios::binary);
         std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         if (bytes.size() > 100) {

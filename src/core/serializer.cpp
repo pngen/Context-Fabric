@@ -1,10 +1,20 @@
 #include "context_fabric/core/serializer.h"
 
 #include <cstring>
+#include <limits>
 
 namespace ctf {
 
 static_assert(sizeof(uint8_t) == 1);
+
+uint32_t checked_u32_size(size_t size, const char* field) {
+    if (size > static_cast<size_t>((std::numeric_limits<uint32_t>::max)())) {
+        throw_error(ErrKind::Capacity,
+                    std::string(field != nullptr ? field : "serialized count") +
+                        " exceeds u32 limit");
+    }
+    return static_cast<uint32_t>(size);
+}
 
 void Writer::u8(uint8_t v) { buf_.push_back(v); }
 void Writer::u16(uint16_t v) {
@@ -27,18 +37,24 @@ void Writer::f64(double v) {
     std::memcpy(&bits, &v, sizeof(bits));
     u64(bits);
 }
-void Writer::append(const uint8_t* p, size_t n) { buf_.insert(buf_.end(), p, p + n); }
+void Writer::append(const uint8_t* p, size_t n) {
+    if (n == 0) return;
+    if (p == nullptr) throw_error(ErrKind::InvalidArgument, "null serialization source");
+    if (n > buf_.max_size() - buf_.size()) {
+        throw_error(ErrKind::Capacity, "serialized buffer exceeds addressable size");
+    }
+    buf_.insert(buf_.end(), p, p + n);
+}
 void Writer::bytes(const uint8_t* p, size_t n) {
-    if (n > 0xFFFFFFFFu) throw_error(ErrKind::Capacity, "serialized field exceeds u32 length limit");
-    u32(static_cast<uint32_t>(n));
+    if (n != 0 && p == nullptr) throw_error(ErrKind::InvalidArgument, "null serialization source");
+    u32(checked_u32_size(n, "serialized field length"));
     append(p, n);
 }
 void Writer::str(const std::string& s) {
     bytes(reinterpret_cast<const uint8_t*>(s.data()), s.size());
 }
 void Writer::str_vector(const std::vector<std::string>& v) {
-    if (v.size() > 0xFFFFFFFFu) throw_error(ErrKind::Capacity, "string vector too large");
-    u32(static_cast<uint32_t>(v.size()));
+    u32(checked_u32_size(v.size(), "string vector count"));
     for (const auto& s : v) str(s);
 }
 
@@ -77,6 +93,8 @@ double Reader::f64() {
 }
 void Reader::bytes(uint8_t* out, size_t n) {
     if (remaining() < n) overrun("bytes");
+    if (n == 0) return;
+    if (out == nullptr) throw_error(ErrKind::InvalidArgument, "null deserialization destination");
     std::memcpy(out, p_, n);
     p_ += n;
 }

@@ -57,7 +57,8 @@ public:
     virtual void shutdown() = 0;
 };
 
-// Factory. Returns nullptr when no accelerator is available/compiled in.
-[[nodiscard]] AcceleratorBackend* create_accelerator_backend(uint64_t host_capacity_bytes);
+// Factory. Returns nullptr when accelerator support is not compiled in. A
+// zero capacity selects the backend's conservative device-derived default.
+[[nodiscard]] AcceleratorBackend* create_accelerator_backend(uint64_t accelerator_capacity_bytes);
 
 }  // namespace ctf

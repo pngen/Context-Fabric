@@ -40,7 +40,8 @@ public:
     [[nodiscard]] ErrKind kind() const noexcept { return kind_; }
     [[nodiscard]] uint64_t code() const noexcept { return code_; }
 
-    // Machine-readable description like "integrity:checksum-mismatch".
+    // Stable kind name, optionally followed by the numeric backend/code value
+    // (for example, "cuda:2").
     [[nodiscard]] std::string code_string() const;
 
 private:

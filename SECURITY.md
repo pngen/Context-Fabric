@@ -35,9 +35,14 @@ expose the coordinator or node ports to untrusted networks.
   checksums, and rejection of malformed input.
 - Filesystem path containment for node stores: identities are hex-encoded and
   cannot be used for path traversal.
-- Bounded queues, bounded thread pools, and operation timeouts.
-- Corrupt or tampered persistent records are detected and quarantined, never
-  silently accepted.
+- Bounded queues, bounded thread pools, and socket-operation timeouts. Numeric
+  IPv4 connect paths are end-to-end bounded; on POSIX, hostname lookup retains
+  the platform resolver's deadline, so strict deployments should use numeric
+  endpoints.
+- Truncated or accidentally corrupted persistent records whose stored
+  CRC-32C/SHA-256 fingerprint no longer matches are quarantined. These
+  unkeyed checksums do not protect against a malicious writer who can replace
+  both content and checksum.
 
 ## Future work
 

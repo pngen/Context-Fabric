@@ -1,7 +1,6 @@
 #include "context_fabric/core/prng.h"
 
-#include <cstring>
-
+#include "context_fabric/core/error.h"
 #include "context_fabric/core/integrity.h"
 
 namespace ctf {
@@ -36,11 +35,18 @@ uint64_t Prng::next_u64() noexcept {
 }
 
 void fill_deterministic(uint64_t seed, uint64_t offset, uint8_t* out, size_t n) {
+    if (n != 0 && out == nullptr) {
+        throw_error(ErrKind::InvalidArgument, "deterministic fill requires a non-null destination");
+    }
     Prng rng(seed ^ (offset * 0x9E3779B97F4A7C15ull));
     size_t i = 0;
     while (i + 8 <= n) {
-        uint64_t v = rng.next_u64();
-        std::memcpy(out + i, &v, 8);
+        const uint64_t v = rng.next_u64();
+        // Fixed little-endian byte order preserves identical generated
+        // content on every host architecture.
+        for (size_t byte = 0; byte < 8; ++byte) {
+            out[i + byte] = static_cast<uint8_t>(v >> (byte * 8));
+        }
         i += 8;
     }
     while (i < n) {

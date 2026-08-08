@@ -1,5 +1,8 @@
 #include "context_fabric/authority/client.h"
 
+#include <algorithm>
+#include <chrono>
+#include <limits>
 #include <memory>
 
 #include "context_fabric/core/error.h"
@@ -8,7 +11,39 @@
 
 namespace ctf {
 
+namespace {
+
+using SteadyClock = std::chrono::steady_clock;
+
+SteadyClock::time_point operation_deadline(uint64_t timeout_ms) {
+    using Rep = std::chrono::milliseconds::rep;
+    if (timeout_ms > static_cast<uint64_t>((std::numeric_limits<Rep>::max)())) {
+        return SteadyClock::time_point::max();
+    }
+    const auto duration = std::chrono::milliseconds(static_cast<Rep>(timeout_ms));
+    const auto now = SteadyClock::now();
+    if (duration > SteadyClock::time_point::max() - now) return SteadyClock::time_point::max();
+    return now + duration;
+}
+
+uint64_t remaining_timeout(SteadyClock::time_point deadline) {
+    if (deadline == SteadyClock::time_point::max()) return (std::numeric_limits<uint64_t>::max)();
+    const auto now = SteadyClock::now();
+    if (now >= deadline) throw_error(ErrKind::Timeout, "client operation timed out");
+    const auto remaining = deadline - now;
+    auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+    if (millis < remaining) ++millis;
+    return static_cast<uint64_t>((std::max)(int64_t{1}, millis.count()));
+}
+
+void require_consumed(const Reader& reader) {
+    if (!reader.at_end()) throw_error(ErrKind::Protocol, "trailing bytes after response");
+}
+
+}  // namespace
+
 bool ClientSession::connect(const std::string& host, uint16_t port, uint64_t timeout_ms) {
+    std::lock_guard<std::mutex> lock(rpc_mutex_);
     conn_ = std::make_unique<TransportConnection>("coordinator", Socket(), read_timeout_ms_, write_timeout_ms_);
     if (!conn_->connect(host, port, timeout_ms)) {
         conn_.reset();
@@ -18,13 +53,21 @@ bool ClientSession::connect(const std::string& host, uint16_t port, uint64_t tim
 }
 
 void ClientSession::close() {
+    std::lock_guard<std::mutex> lock(rpc_mutex_);
     if (conn_) conn_->close();
     conn_.reset();
 }
 
 void ClientSession::set_timeouts(uint64_t read_ms, uint64_t write_ms) {
+    std::lock_guard<std::mutex> lock(rpc_mutex_);
     read_timeout_ms_ = read_ms;
     write_timeout_ms_ = write_ms;
+    if (conn_) conn_->set_timeouts(read_ms, write_ms);
+}
+
+bool ClientSession::connected() const noexcept {
+    std::lock_guard<std::mutex> lock(rpc_mutex_);
+    return conn_ && conn_->is_open();
 }
 
 RpcResult ClientSession::call(MessageType req_type, MessageType resp_type,
@@ -35,6 +78,7 @@ RpcResult ClientSession::call(MessageType req_type, MessageType resp_type,
 RpcResult ClientSession::send_request_with_id(MessageType req_type, MessageType resp_type,
                                               const std::vector<uint8_t>& payload,
                                               std::vector<uint8_t>& resp_payload, uint64_t request_id) {
+    std::lock_guard<std::mutex> lock(rpc_mutex_);
     if (!conn_ || !conn_->is_open()) throw_error(ErrKind::Transport, "not connected to coordinator");
     conn_->send(req_type, request_id, 0, payload);
     FrameHeader hdr = conn_->recv(resp_payload);
@@ -58,6 +102,7 @@ uint32_t ClientSession::hello() {
     if (r.failed()) throw_error(r.err, r.message);
     Reader rd(payload.data(), payload.size());
     HelloResp resp = deserialize_hello_resp(rd);
+    require_consumed(rd);
     if (resp.protocol_version != kProtocolVersion) throw_error(ErrKind::Protocol, "protocol version mismatch");
     epoch_ = resp.coordinator_epoch;
     return epoch_;
@@ -78,6 +123,7 @@ ObjectCreateResp ClientSession::create_object(const ObjectId& id, const ContextM
     call(kMsgObjectCreate, kMsgObjectCreateResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
      ObjectCreateResp resp = deserialize_object_create_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     return resp;
 }
@@ -86,7 +132,9 @@ void ClientSession::send_blocks(Socket& peer, uint64_t op_token, const ObjectId&
                                 const std::vector<uint8_t>& data) {
     IntegrityId idg = compute_integrity(data.data(), data.size());
     const uint64_t chunk = 1024 * 1024;
-    uint64_t total = (data.size() + chunk - 1) / chunk;
+    if (data.empty()) throw_error(ErrKind::InvalidArgument, "upload data must be nonempty");
+    const uint64_t total = 1 + (static_cast<uint64_t>(data.size()) - 1) / chunk;
+    const auto deadline = operation_deadline((std::max)(read_timeout_ms_, write_timeout_ms_));
     for (uint64_t seq = 0; seq < total; ++seq) {
         size_t off = static_cast<size_t>(seq * chunk);
         size_t len = static_cast<size_t>(std::min<uint64_t>(chunk, data.size() - off));
@@ -103,12 +151,16 @@ void ClientSession::send_blocks(Socket& peer, uint64_t op_token, const ObjectId&
                           data.begin() + static_cast<std::ptrdiff_t>(off + len));
         Writer w;
         serialize_data_block(w, block);
-        send_frame(peer, kMsgDataBlock, next_request_id(), 0, w.data(), write_timeout_ms_);
+        send_frame(peer, kMsgDataBlock, next_request_id(), 0, w.data(), remaining_timeout(deadline));
         std::vector<uint8_t> ack_payload;
-        FrameHeader ack_hdr = recv_frame(peer, ack_payload, read_timeout_ms_);
+        FrameHeader ack_hdr = recv_frame(peer, ack_payload, remaining_timeout(deadline));
         if (ack_hdr.type != kMsgDataBlockAck) throw_error(ErrKind::Protocol, "unexpected ack");
         Reader ar(ack_payload.data(), ack_payload.size());
         DataBlockAckMsg ack = deserialize_data_block_ack(ar);
+        require_consumed(ar);
+        if (ack.op_token != op_token || ack.object_id != id || ack.generation != gen || ack.seq != seq) {
+            throw_error(ErrKind::Protocol, "data-block ack identity mismatch");
+        }
         if (ack.result.failed()) throw CfError(ack.result.err, ack.result.message);
     }
     peer.shutdown_send();
@@ -133,6 +185,7 @@ ObjectInspectResp ClientSession::inspect(const ObjectId& id) {
     call(kMsgObjectInspect, kMsgObjectInspectResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
      ObjectInspectResp resp = deserialize_object_inspect_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     return resp;
 }
@@ -146,6 +199,7 @@ ObjectListResp ClientSession::list(const std::string& namespace_filter) {
     call(kMsgObjectList, kMsgObjectListResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
      ObjectListResp resp = deserialize_object_list_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     return resp;
 }
@@ -159,6 +213,7 @@ LineageQueryResp ClientSession::lineage(const ObjectId& id) {
     call(kMsgLineageQuery, kMsgLineageQueryResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
      LineageQueryResp resp = deserialize_lineage_query_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     return resp;
 }
@@ -173,6 +228,7 @@ ObjectDeleteResp ClientSession::remove(const ObjectId& id, bool force) {
     call(kMsgObjectDelete, kMsgObjectDeleteResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
      ObjectDeleteResp resp = deserialize_object_delete_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     return resp;
 }
@@ -190,6 +246,7 @@ LeaseAcquireResp ClientSession::lease_acquire(const ObjectId& id, uint64_t holde
     call(kMsgLeaseAcquire, kMsgLeaseAcquireResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
      LeaseAcquireResp resp = deserialize_lease_acquire_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     return resp;
 }
@@ -205,6 +262,7 @@ LeaseReleaseResp ClientSession::lease_release(const ObjectId& id, uint64_t holde
     call(kMsgLeaseRelease, kMsgLeaseReleaseResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
      LeaseReleaseResp resp = deserialize_lease_release_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     return resp;
 }
@@ -225,6 +283,7 @@ ObjectWriteResp ClientSession::write_generation(const ObjectId& id, const Genera
     call(kMsgObjectWrite, kMsgObjectWriteResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
      ObjectWriteResp resp = deserialize_object_write_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     upload_data(resp.data_addr, resp.op_token, id, resp.generation, data);
     return resp;
@@ -240,6 +299,7 @@ ReplicateResp ClientSession::replicate(const ObjectId& id, uint64_t target_node)
     call(kMsgReplicate, kMsgReplicateResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
      ReplicateResp resp = deserialize_replicate_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     return resp;
 }
@@ -257,6 +317,7 @@ MigrateResp ClientSession::migrate(const ObjectId& id, uint64_t target_node, Sto
     call(kMsgMigrate, kMsgMigrateResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
      MigrateResp resp = deserialize_migrate_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     return resp;
 }
@@ -271,6 +332,7 @@ PersistResp ClientSession::persist(const ObjectId& id, uint64_t on_node) {
     call(kMsgPersist, kMsgPersistResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
      PersistResp resp = deserialize_persist_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     return resp;
 }
@@ -285,6 +347,7 @@ RestoreResp ClientSession::restore(const ObjectId& id, uint64_t to_node) {
     call(kMsgRestore, kMsgRestoreResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
      RestoreResp resp = deserialize_restore_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     return resp;
 }
@@ -300,6 +363,7 @@ VerifyResp ClientSession::verify(const ObjectId& id, uint64_t on_node, bool deep
     call(kMsgVerify, kMsgVerifyResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
      VerifyResp resp = deserialize_verify_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     return resp;
 }
@@ -316,6 +380,7 @@ PlacementQueryResp ClientSession::placement(const ContextMetadata& metadata, uin
     call(kMsgPlacementQuery, kMsgPlacementQueryResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
      PlacementQueryResp resp = deserialize_placement_query_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     return resp;
 }
@@ -333,6 +398,7 @@ DecisionQueryResp ClientSession::decision(const ContextMetadata& metadata, uint6
     RpcResult r = call(kMsgDecisionQuery, kMsgDecisionQueryResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
     DecisionQueryResp resp = deserialize_decision_query_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
     return resp;
 }
@@ -346,6 +412,7 @@ void ClientSession::shutdown_node(uint64_t node_id) {
     call(kMsgCoordShutdownNode, kMsgCoordShutdownNodeResp, w.data(), payload);
     Reader rd(payload.data(), payload.size());
     CoordShutdownNodeResp resp = deserialize_coord_shutdown_node_resp(rd);
+    require_consumed(rd);
     if (resp.result.failed()) throw CfError(resp.result.err, resp.result.message);
 }
 

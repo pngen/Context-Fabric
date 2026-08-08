@@ -16,7 +16,7 @@ public:
     JsonObject() = default;
 
     JsonObject& field(const char* name, const char* value);
-    JsonObject& field(const char* name, const std::string& value) { return field(name, value.c_str()); }
+    JsonObject& field(const char* name, const std::string& value);
     JsonObject& field(const char* name, bool value);
     JsonObject& field(const char* name, int64_t value);
     JsonObject& field(const char* name, uint64_t value);

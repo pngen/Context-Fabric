@@ -40,5 +40,7 @@ int main() {
     std::printf("hot state (1 MiB, 100 reuses):          -> %s\n",
                 d3.chose_transfer ? "TRANSFER" : "RECOMPUTE");
     std::printf("  %s\n", d3.reason.c_str());
-    return 0;
+    bool expected = d1.chose_transfer && !d2.chose_transfer && d3.chose_transfer;
+    if (!expected) std::fprintf(stderr, "planner choices did not match the demonstrated scenarios\n");
+    return expected ? 0 : 1;
 }

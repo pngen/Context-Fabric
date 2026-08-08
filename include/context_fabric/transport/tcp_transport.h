@@ -31,6 +31,8 @@ public:
               const std::vector<uint8_t>& payload);
     FrameHeader recv(std::vector<uint8_t>& payload);
 
+    void set_timeouts(uint64_t read_timeout_ms, uint64_t write_timeout_ms) noexcept;
+
     void close();
     [[nodiscard]] bool is_open() const noexcept;
 

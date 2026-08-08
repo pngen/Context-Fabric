@@ -1,14 +1,23 @@
 #include "context_fabric/transport/socket.h"
 
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <climits>
 #include <cstring>
+#include <limits>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "context_fabric/core/error.h"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <arpa/inet.h>
@@ -25,7 +34,40 @@
 namespace ctf {
 
 #if defined(_WIN32)
+using socket_int_t = SOCKET;
+#else
+using socket_int_t = int;
+#endif
+
 namespace {
+
+using SteadyClock = std::chrono::steady_clock;
+
+SteadyClock::time_point deadline_after(uint64_t timeout_ms) {
+    const auto now = SteadyClock::now();
+    const auto max_delta = SteadyClock::time_point::max() - now;
+    const auto max_ms = std::chrono::duration_cast<std::chrono::milliseconds>(max_delta).count();
+    const uint64_t bounded = std::min(timeout_ms, static_cast<uint64_t>(max_ms));
+    return now + std::chrono::milliseconds(bounded);
+}
+
+uint64_t remaining_ms(SteadyClock::time_point deadline) {
+    const auto now = SteadyClock::now();
+    if (now >= deadline) return 0;
+    const auto delta = deadline - now;
+    const auto whole = std::chrono::duration_cast<std::chrono::milliseconds>(delta).count();
+    return whole > 0 ? static_cast<uint64_t>(whole) : 1;
+}
+
+bool is_invalid_socket(socket_int_t fd) {
+#if defined(_WIN32)
+    return fd == INVALID_SOCKET;
+#else
+    return fd < 0;
+#endif
+}
+
+#if defined(_WIN32)
 struct WsaInitializer {
     WsaInitializer() {
         WSADATA data;
@@ -36,16 +78,7 @@ struct WsaInitializer {
     ~WsaInitializer() { WSACleanup(); }
 };
 WsaInitializer g_wsa;
-}  // namespace
 #endif
-
-#if defined(_WIN32)
-using socket_int_t = SOCKET;
-#else
-using socket_int_t = int;
-#endif
-
-namespace {
 
 socket_int_t to_fd(uintptr_t fd) {
 #if defined(_WIN32)
@@ -73,36 +106,150 @@ void close_fd(uintptr_t fd) {
 
 bool set_recv_timeout(uintptr_t fd, uint64_t ms) {
 #if defined(_WIN32)
-    DWORD t = static_cast<DWORD>(ms);
+    DWORD t = static_cast<DWORD>(std::min<uint64_t>(std::max<uint64_t>(ms, 1), MAXDWORD));
     return setsockopt(to_fd(fd), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&t), sizeof(t)) == 0;
 #else
-    timeval tv;
-    tv.tv_sec = static_cast<long>(ms / 1000);
-    tv.tv_usec = static_cast<long>((ms % 1000) * 1000);
+    timeval tv{};
+    const uint64_t bounded = std::max<uint64_t>(ms, 1);
+    const uint64_t max_seconds = static_cast<uint64_t>(std::numeric_limits<decltype(tv.tv_sec)>::max());
+    tv.tv_sec = static_cast<decltype(tv.tv_sec)>(std::min<uint64_t>(bounded / 1000, max_seconds));
+    tv.tv_usec = tv.tv_sec == static_cast<decltype(tv.tv_sec)>(max_seconds)
+                     ? 0
+                     : static_cast<decltype(tv.tv_usec)>((bounded % 1000) * 1000);
     return setsockopt(to_fd(fd), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
 #endif
 }
 
 bool set_send_timeout(uintptr_t fd, uint64_t ms) {
 #if defined(_WIN32)
-    DWORD t = static_cast<DWORD>(ms);
+    DWORD t = static_cast<DWORD>(std::min<uint64_t>(std::max<uint64_t>(ms, 1), MAXDWORD));
     return setsockopt(to_fd(fd), SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&t), sizeof(t)) == 0;
 #else
-    timeval tv;
-    tv.tv_sec = static_cast<long>(ms / 1000);
-    tv.tv_usec = static_cast<long>((ms % 1000) * 1000);
+    timeval tv{};
+    const uint64_t bounded = std::max<uint64_t>(ms, 1);
+    const uint64_t max_seconds = static_cast<uint64_t>(std::numeric_limits<decltype(tv.tv_sec)>::max());
+    tv.tv_sec = static_cast<decltype(tv.tv_sec)>(std::min<uint64_t>(bounded / 1000, max_seconds));
+    tv.tv_usec = tv.tv_sec == static_cast<decltype(tv.tv_sec)>(max_seconds)
+                     ? 0
+                     : static_cast<decltype(tv.tv_usec)>((bounded % 1000) * 1000);
     return setsockopt(to_fd(fd), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
 #endif
 }
 
+bool numeric_ipv4(const std::string& host, uint16_t port, sockaddr_in& address) {
+    std::memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    return inet_pton(AF_INET, host.c_str(), &address.sin_addr) == 1;
+}
+
+bool is_localhost(const std::string& host) {
+    static constexpr char name[] = "localhost";
+    if (host.size() != sizeof(name) - 1) return false;
+    for (size_t i = 0; i < host.size(); ++i) {
+        char c = host[i];
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        if (c != name[i]) return false;
+    }
+    return true;
+}
+
+bool resolve_ipv4(const std::string& host, uint16_t port, uint64_t timeout_ms,
+                  std::vector<sockaddr_in>& addresses) {
+    addresses.clear();
+    sockaddr_in numeric{};
+    if (numeric_ipv4(host, port, numeric)) {
+        addresses.push_back(numeric);
+        return true;
+    }
+    if (is_localhost(host)) {
+        numeric.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addresses.push_back(numeric);
+        return true;
+    }
+    if (host.empty() || timeout_ms == 0) return false;
+
+#if defined(_WIN32)
+    if (host.size() > static_cast<size_t>(INT_MAX)) return false;
+    int wide_chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, host.data(),
+                                         static_cast<int>(host.size()), nullptr, 0);
+    if (wide_chars <= 0) return false;
+    std::wstring wide_host(static_cast<size_t>(wide_chars), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, host.data(), static_cast<int>(host.size()),
+                            wide_host.data(), wide_chars) != wide_chars) {
+        return false;
+    }
+
+    ADDRINFOEXW hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    timeval timeout{};
+    const uint64_t seconds = timeout_ms / 1000;
+    timeout.tv_sec = static_cast<long>((std::min)(seconds, static_cast<uint64_t>(LONG_MAX)));
+    timeout.tv_usec = seconds >= static_cast<uint64_t>(LONG_MAX)
+                          ? 0
+                          : static_cast<long>((timeout_ms % 1000) * 1000);
+    PADDRINFOEXW raw = nullptr;
+    int rc = GetAddrInfoExW(wide_host.c_str(), nullptr, NS_ALL, nullptr, &hints, &raw, &timeout,
+                            nullptr, nullptr, nullptr);
+    struct AddressGuard {
+        void operator()(ADDRINFOEXW* value) const noexcept {
+            if (value != nullptr) FreeAddrInfoExW(value);
+        }
+    };
+    std::unique_ptr<ADDRINFOEXW, AddressGuard> result(raw);
+    if (rc != 0 || result == nullptr) return false;
+    for (ADDRINFOEXW* current = result.get(); current != nullptr; current = current->ai_next) {
+        if (current->ai_family != AF_INET || current->ai_addr == nullptr ||
+            current->ai_addrlen < sizeof(sockaddr_in)) {
+            continue;
+        }
+        sockaddr_in address{};
+        std::memcpy(&address, current->ai_addr, sizeof(address));
+        address.sin_port = htons(port);
+        addresses.push_back(address);
+    }
+#else
+    // POSIX getaddrinfo has no portable caller-supplied deadline or safe
+    // cancellation mechanism. Numeric endpoints above remain fully bounded;
+    // hostname resolution inherits the platform resolver's deadline.
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    addrinfo* raw = nullptr;
+    int rc = ::getaddrinfo(host.c_str(), nullptr, &hints, &raw);
+    struct AddressGuard {
+        void operator()(addrinfo* value) const noexcept {
+            if (value != nullptr) freeaddrinfo(value);
+        }
+    };
+    std::unique_ptr<addrinfo, AddressGuard> result(raw);
+    if (rc != 0 || result == nullptr) return false;
+    for (addrinfo* current = result.get(); current != nullptr; current = current->ai_next) {
+        if (current->ai_family != AF_INET || current->ai_addr == nullptr ||
+            current->ai_addrlen < sizeof(sockaddr_in)) {
+            continue;
+        }
+        sockaddr_in address{};
+        std::memcpy(&address, current->ai_addr, sizeof(address));
+        address.sin_port = htons(port);
+        addresses.push_back(address);
+    }
+#endif
+    return !addresses.empty();
+}
+
 // Blocking connect with timeout via select.
 bool connect_with_timeout(uintptr_t fd, const sockaddr_in& addr, uint64_t timeout_ms) {
+    const auto deadline = deadline_after(timeout_ms);
 #if defined(_WIN32)
     u_long mode = 1;
-    ioctlsocket(to_fd(fd), FIONBIO, &mode);
+    if (ioctlsocket(to_fd(fd), FIONBIO, &mode) != 0) return false;
 #else
     int flags = fcntl(to_fd(fd), F_GETFL, 0);
-    fcntl(to_fd(fd), F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0 || fcntl(to_fd(fd), F_SETFL, flags | O_NONBLOCK) != 0) return false;
 #endif
 
     int rc = ::connect(to_fd(fd), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
@@ -110,10 +257,9 @@ bool connect_with_timeout(uintptr_t fd, const sockaddr_in& addr, uint64_t timeou
         // Already connected; restore blocking.
 #if defined(_WIN32)
         mode = 0;
-        ioctlsocket(to_fd(fd), FIONBIO, &mode);
+        if (ioctlsocket(to_fd(fd), FIONBIO, &mode) != 0) return false;
 #else
-        int fl = fcntl(to_fd(fd), F_GETFL, 0);
-        fcntl(to_fd(fd), F_SETFL, fl & ~O_NONBLOCK);
+        if (fcntl(to_fd(fd), F_SETFL, flags) != 0) return false;
 #endif
         return true;
     }
@@ -125,14 +271,25 @@ bool connect_with_timeout(uintptr_t fd, const sockaddr_in& addr, uint64_t timeou
     if (errno != EINPROGRESS) return false;
 #endif
 
-    fd_set wset;
-    FD_ZERO(&wset);
-    FD_SET(to_fd(fd), &wset);
-    timeval tv;
-    tv.tv_sec = static_cast<long>(timeout_ms / 1000);
-    tv.tv_usec = static_cast<long>((timeout_ms % 1000) * 1000);
-    rc = ::select(0, nullptr, &wset, nullptr, &tv);
-    if (rc <= 0) return false;
+    while (true) {
+        const uint64_t left = remaining_ms(deadline);
+        if (left == 0) return false;
+        fd_set wset;
+        FD_ZERO(&wset);
+        FD_SET(to_fd(fd), &wset);
+        timeval tv{};
+        tv.tv_sec = static_cast<long>(std::min<uint64_t>(left / 1000, static_cast<uint64_t>(LONG_MAX)));
+        tv.tv_usec = static_cast<long>((left % 1000) * 1000);
+#if defined(_WIN32)
+        rc = ::select(0, nullptr, &wset, nullptr, &tv);
+        if (rc < 0 && WSAGetLastError() == WSAEINTR) continue;
+#else
+        rc = ::select(to_fd(fd) + 1, nullptr, &wset, nullptr, &tv);
+        if (rc < 0 && errno == EINTR) continue;
+#endif
+        if (rc <= 0) return false;
+        break;
+    }
 
     // Check socket error.
     int so_error = 0;
@@ -147,10 +304,9 @@ bool connect_with_timeout(uintptr_t fd, const sockaddr_in& addr, uint64_t timeou
 
 #if defined(_WIN32)
     mode = 0;
-    ioctlsocket(to_fd(fd), FIONBIO, &mode);
+    if (ioctlsocket(to_fd(fd), FIONBIO, &mode) != 0) return false;
 #else
-    int fl = fcntl(to_fd(fd), F_GETFL, 0);
-    fcntl(to_fd(fd), F_SETFL, fl & ~O_NONBLOCK);
+    if (fcntl(to_fd(fd), F_SETFL, flags) != 0) return false;
 #endif
     return true;
 }
@@ -172,23 +328,18 @@ Socket::~Socket() { close(); }
 
 bool Socket::connect(const std::string& host, uint16_t port, uint64_t timeout_ms) {
     close();
+    if (host.empty() || port == 0 || timeout_ms == 0) return false;
+    const auto deadline = deadline_after(timeout_ms);
 
-    addrinfo hints;
-    std::memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-
-    addrinfo* result = nullptr;
-    char port_buf[16];
-    snprintf(port_buf, sizeof(port_buf), "%u", static_cast<unsigned>(port));
-    int rc = ::getaddrinfo(host.c_str(), port_buf, &hints, &result);
-    if (rc != 0 || result == nullptr) return false;
+    std::vector<sockaddr_in> addresses;
+    if (!resolve_ipv4(host, port, remaining_ms(deadline), addresses)) return false;
 
     bool ok = false;
-    for (addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
-        socket_int_t s = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (s == static_cast<socket_int_t>(~uintptr_t(0))) continue;
+    for (const sockaddr_in& address : addresses) {
+        const uint64_t left = remaining_ms(deadline);
+        if (left == 0) break;
+        socket_int_t s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (is_invalid_socket(s)) continue;
         fd_ = to_handle(s);
 
 #if defined(_WIN32)
@@ -199,15 +350,13 @@ bool Socket::connect(const std::string& host, uint16_t port, uint64_t timeout_ms
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 #endif
 
-        sockaddr_in* sa = reinterpret_cast<sockaddr_in*>(ai->ai_addr);
-        if (connect_with_timeout(fd_, *sa, timeout_ms)) {
+        if (connect_with_timeout(fd_, address, left)) {
             ok = true;
             break;
         }
         close_fd(fd_);
         fd_ = kInvalid;
     }
-    freeaddrinfo(result);
     return ok;
 }
 
@@ -215,13 +364,14 @@ bool Socket::listen(const std::string& host, uint16_t port, uint16_t& bound_port
     close();
 
     socket_int_t s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == static_cast<socket_int_t>(~uintptr_t(0))) return false;
+    if (is_invalid_socket(s)) return false;
     fd_ = to_handle(s);
 
-    int reuse = 1;
 #if defined(_WIN32)
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+    BOOL exclusive = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
 #else
+    int reuse = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 #endif
 
@@ -232,7 +382,10 @@ bool Socket::listen(const std::string& host, uint16_t port, uint16_t& bound_port
     if (host.empty() || host == "0.0.0.0" || host == "*") {
         addr.sin_addr.s_addr = INADDR_ANY;
     } else {
-        inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+        if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+            close();
+            return false;
+        }
     }
 
     if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
@@ -263,17 +416,31 @@ bool Socket::listen(const std::string& host, uint16_t port, uint16_t& bound_port
 }
 
 Socket Socket::accept(uint64_t timeout_ms) {
-    fd_set rset;
-    FD_ZERO(&rset);
-    FD_SET(to_fd(fd_), &rset);
-    timeval tv;
-    tv.tv_sec = static_cast<long>(timeout_ms / 1000);
-    tv.tv_usec = static_cast<long>((timeout_ms % 1000) * 1000);
-    int rc = ::select(0, &rset, nullptr, nullptr, &tv);
-    if (rc <= 0) return Socket();
+    if (!valid()) return Socket();
+    const auto deadline = deadline_after(timeout_ms);
+    int rc = 0;
+    while (true) {
+        const uint64_t left = remaining_ms(deadline);
+        if (left == 0) return Socket();
+        fd_set rset;
+        FD_ZERO(&rset);
+        FD_SET(to_fd(fd_), &rset);
+        timeval tv{};
+        tv.tv_sec = static_cast<long>(std::min<uint64_t>(left / 1000, static_cast<uint64_t>(LONG_MAX)));
+        tv.tv_usec = static_cast<long>((left % 1000) * 1000);
+#if defined(_WIN32)
+        rc = ::select(0, &rset, nullptr, nullptr, &tv);
+        if (rc < 0 && WSAGetLastError() == WSAEINTR) continue;
+#else
+        rc = ::select(to_fd(fd_) + 1, &rset, nullptr, nullptr, &tv);
+        if (rc < 0 && errno == EINTR) continue;
+#endif
+        if (rc <= 0) return Socket();
+        break;
+    }
 
     socket_int_t s = ::accept(to_fd(fd_), nullptr, nullptr);
-    if (s == static_cast<socket_int_t>(~uintptr_t(0))) return Socket();
+    if (is_invalid_socket(s)) return Socket();
 
     Socket out;
     out.fd_ = to_handle(s);
@@ -288,13 +455,18 @@ Socket Socket::accept(uint64_t timeout_ms) {
 }
 
 void Socket::send_all(const void* data, size_t len, uint64_t timeout_ms) {
-    if (len == 0 || !valid()) return;
-    if (!set_send_timeout(fd_, timeout_ms)) {
-        throw_error(ErrKind::Transport, "failed to set send timeout");
-    }
+    if (len == 0) return;
+    if (data == nullptr) throw_error(ErrKind::InvalidArgument, "cannot send from a null buffer");
+    if (!valid()) throw_error(ErrKind::Transport, "cannot send on a closed socket");
+    const auto deadline = deadline_after(timeout_ms);
     const char* p = static_cast<const char*>(data);
     size_t sent = 0;
     while (sent < len) {
+        const uint64_t left = remaining_ms(deadline);
+        if (left == 0) throw_error(ErrKind::Timeout, "send timed out");
+        if (!set_send_timeout(fd_, left)) {
+            throw_error(ErrKind::Transport, "failed to set send timeout");
+        }
 #if defined(_WIN32)
         int n = ::send(to_fd(fd_), p + sent, static_cast<int>((len - sent) > INT_MAX ? INT_MAX : (len - sent)), 0);
 #else
@@ -303,8 +475,12 @@ void Socket::send_all(const void* data, size_t len, uint64_t timeout_ms) {
         if (n <= 0) {
 #if defined(_WIN32)
             int err = WSAGetLastError();
-            if (err == WSAETIMEDOUT) throw_error(ErrKind::Timeout, "send timed out");
+            if (err == WSAEINTR) continue;
+            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+                throw_error(ErrKind::Timeout, "send timed out");
+            }
 #else
+            if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) throw_error(ErrKind::Timeout, "send timed out");
 #endif
             throw_error(ErrKind::Transport, "send failed");
@@ -314,28 +490,39 @@ void Socket::send_all(const void* data, size_t len, uint64_t timeout_ms) {
 }
 
 size_t Socket::recv_some(void* data, size_t len, uint64_t timeout_ms) {
-    if (len == 0 || !valid()) return 0;
-    if (!set_recv_timeout(fd_, timeout_ms)) {
-        throw_error(ErrKind::Transport, "failed to set receive timeout");
-    }
+    if (len == 0) return 0;
+    if (data == nullptr) throw_error(ErrKind::InvalidArgument, "cannot receive into a null buffer");
+    if (!valid()) throw_error(ErrKind::Transport, "cannot receive on a closed socket");
+    const auto deadline = deadline_after(timeout_ms);
+    while (true) {
+        const uint64_t left = remaining_ms(deadline);
+        if (left == 0) throw_error(ErrKind::Timeout, "receive timed out");
+        if (!set_recv_timeout(fd_, left)) {
+            throw_error(ErrKind::Transport, "failed to set receive timeout");
+        }
 #if defined(_WIN32)
-    int n = ::recv(to_fd(fd_), static_cast<char*>(data), static_cast<int>(len > INT_MAX ? INT_MAX : len), 0);
+        int n = ::recv(to_fd(fd_), static_cast<char*>(data), static_cast<int>(len > INT_MAX ? INT_MAX : len), 0);
 #else
-    ssize_t n = ::recv(to_fd(fd_), data, len, 0);
+        ssize_t n = ::recv(to_fd(fd_), data, len, 0);
 #endif
-    if (n == 0) return 0;  // orderly EOF
-    if (n < 0) {
+        if (n == 0) return 0;  // orderly EOF
+        if (n < 0) {
 #if defined(_WIN32)
-        int err = WSAGetLastError();
-        if (err == WSAETIMEDOUT) throw_error(ErrKind::Timeout, "receive timed out");
-        if (err == WSAECONNRESET) throw_error(ErrKind::Transport, "connection reset");
+            int err = WSAGetLastError();
+            if (err == WSAEINTR) continue;
+            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+                throw_error(ErrKind::Timeout, "receive timed out");
+            }
+            if (err == WSAECONNRESET) throw_error(ErrKind::Transport, "connection reset");
 #else
-        if (errno == EAGAIN || errno == EWOULDBLOCK) throw_error(ErrKind::Timeout, "receive timed out");
-        if (errno == ECONNRESET) throw_error(ErrKind::Transport, "connection reset");
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) throw_error(ErrKind::Timeout, "receive timed out");
+            if (errno == ECONNRESET) throw_error(ErrKind::Transport, "connection reset");
 #endif
-        throw_error(ErrKind::Transport, "receive failed");
+            throw_error(ErrKind::Transport, "receive failed");
+        }
+        return static_cast<size_t>(n);
     }
-    return static_cast<size_t>(n);
 }
 
 void Socket::shutdown_send() {
@@ -370,14 +557,14 @@ std::string Socket::peer_address() const {
     int len = sizeof(addr);
     if (getpeername(to_fd(fd_), reinterpret_cast<sockaddr*>(&addr), &len) != 0) return "";
     char buf[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf));
+    if (inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf)) == nullptr) return "";
     return std::string(buf) + ":" + std::to_string(ntohs(addr.sin_port));
 #else
     sockaddr_in addr;
     socklen_t len = sizeof(addr);
     if (getpeername(to_fd(fd_), reinterpret_cast<sockaddr*>(&addr), &len) != 0) return "";
     char buf[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf));
+    if (inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf)) == nullptr) return "";
     return std::string(buf) + ":" + std::to_string(ntohs(addr.sin_port));
 #endif
 }

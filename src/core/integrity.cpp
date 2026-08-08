@@ -1,11 +1,17 @@
 #include "context_fabric/core/integrity.h"
 
 #include <cstring>
+#include <limits>
+#include <mutex>
 
 #include "context_fabric/core/error.h"
 
-#if defined(__x86_64__) || defined(_M_X64)
-#define CF_HAS_X86 1
+#if defined(_MSC_VER) && defined(_M_X64)
+#define CF_HAS_CRC32C_INTRINSICS 1
+#include <intrin.h>
+#include <nmmintrin.h>
+#elif defined(__SSE4_2__) && (defined(__x86_64__) || defined(__i386__))
+#define CF_HAS_CRC32C_INTRINSICS 1
 #include <nmmintrin.h>
 #endif
 
@@ -17,7 +23,7 @@ namespace ctf {
 namespace {
 
 static uint32_t crc32c_table[256];
-static bool crc_table_ready = false;
+static std::once_flag crc_table_once;
 
 void build_table() noexcept {
     for (uint32_t i = 0; i < 256; ++i) {
@@ -27,39 +33,63 @@ void build_table() noexcept {
         }
         crc32c_table[i] = crc;
     }
-    crc_table_ready = true;
 }
 
 uint32_t crc32c_soft(const uint8_t* p, size_t len, uint32_t crc) noexcept {
-    if (!crc_table_ready) build_table();
+    std::call_once(crc_table_once, build_table);
     for (size_t i = 0; i < len; ++i) {
         crc = crc32c_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
     }
     return crc;
 }
 
+#if defined(CF_HAS_CRC32C_INTRINSICS)
+bool crc32c_hardware_available() noexcept {
+#if defined(_MSC_VER)
+    static const bool available = [] {
+        int regs[4] = {};
+        __cpuid(regs, 1);
+        return (regs[2] & (1 << 20)) != 0;
+    }();
+    return available;
+#else
+    return true;
+#endif
+}
+#endif
+
 }  // namespace
 
 void Crc32C::update(const void* data, size_t len) {
+    if (len == 0) return;
+    if (data == nullptr) throw_error(ErrKind::InvalidArgument, "null CRC-32C input");
     const uint8_t* p = static_cast<const uint8_t*>(data);
-#if defined(CF_HAS_X86)
+#if defined(CF_HAS_CRC32C_INTRINSICS)
     // Hardware-accelerated path (SSE4.2 crc32 instruction).
-    size_t i = 0;
-    while (len - i >= 8) {
-        crc_ = static_cast<uint32_t>(_mm_crc32_u64(crc_, *reinterpret_cast<const uint64_t*>(p + i)));
-        i += 8;
-    }
-    while (len - i >= 4) {
-        crc_ = _mm_crc32_u32(crc_, *reinterpret_cast<const uint32_t*>(p + i));
-        i += 4;
-    }
-    while (len - i >= 1) {
-        crc_ = _mm_crc32_u8(crc_, p[i]);
-        ++i;
-    }
-#else
-    crc_ = crc32c_soft(p, len, crc_);
+    if (crc32c_hardware_available()) {
+        size_t i = 0;
+#if defined(__x86_64__) || defined(_M_X64)
+        while (len - i >= 8) {
+            uint64_t word = 0;
+            std::memcpy(&word, p + i, sizeof(word));
+            crc_ = static_cast<uint32_t>(_mm_crc32_u64(crc_, word));
+            i += 8;
+        }
 #endif
+        while (len - i >= 4) {
+            uint32_t word = 0;
+            std::memcpy(&word, p + i, sizeof(word));
+            crc_ = _mm_crc32_u32(crc_, word);
+            i += 4;
+        }
+        while (i < len) {
+            crc_ = _mm_crc32_u8(crc_, p[i]);
+            ++i;
+        }
+        return;
+    }
+#endif
+    crc_ = crc32c_soft(p, len, crc_);
 }
 
 uint32_t Crc32C::compute(const void* data, size_t len) {
@@ -117,6 +147,12 @@ void Sha256::process_block(const uint8_t* block) {
 
 void Sha256::update(const void* data, size_t len) {
     if (finished_) throw_error(ErrKind::State, "sha256 already finalized");
+    if (len == 0) return;
+    if (data == nullptr) throw_error(ErrKind::InvalidArgument, "null SHA-256 input");
+    constexpr uint64_t kMaxSha256Bytes = (std::numeric_limits<uint64_t>::max)() / 8;
+    if (total_len_ > kMaxSha256Bytes || len > kMaxSha256Bytes - total_len_) {
+        throw_error(ErrKind::Capacity, "SHA-256 input length overflow");
+    }
     const uint8_t* p = static_cast<const uint8_t*>(data);
     total_len_ += len;
 
@@ -155,19 +191,18 @@ std::array<uint8_t, 32> Sha256::finalize() {
         return out;
     }
     uint64_t bit_len = total_len_ * 8;
-    uint8_t pad = 0x80;
-    update(&pad, 1);
-    uint8_t zero = 0;
-    while (buf_len_ != 56) {
-        if (buf_len_ == 64) {  // process a full block, then continue padding
-            process_block(buf_.data());
-            buf_len_ = 0;
-        }
-        update(&zero, 1);
+    buf_[buf_len_++] = 0x80;
+    if (buf_len_ > 56) {
+        while (buf_len_ < 64) buf_[buf_len_++] = 0;
+        process_block(buf_.data());
+        buf_len_ = 0;
     }
-    uint8_t len_bytes[8];
-    for (int i = 0; i < 8; ++i) len_bytes[i] = static_cast<uint8_t>(bit_len >> (8 * (7 - i)));
-    update(len_bytes, 8);
+    while (buf_len_ < 56) buf_[buf_len_++] = 0;
+    for (int i = 0; i < 8; ++i) {
+        buf_[56 + static_cast<size_t>(i)] = static_cast<uint8_t>(bit_len >> (8 * (7 - i)));
+    }
+    process_block(buf_.data());
+    buf_len_ = 0;
     finished_ = true;
 
     std::array<uint8_t, 32> out{};
@@ -181,9 +216,10 @@ std::array<uint8_t, 32> Sha256::finalize() {
 }
 
 uint64_t Sha256::fingerprint() const {
-    // Returns first 8 bytes of the current digest (only meaningful after finalize).
+    Sha256 copy = *this;
+    const auto digest = copy.finalize();
     uint64_t v = 0;
-    for (int i = 0; i < 8; ++i) v = (v << 8) | static_cast<uint64_t>(h_[i] >> 24);
+    for (int i = 0; i < 8; ++i) v = (v << 8) | digest[static_cast<size_t>(i)];
     return v;
 }
 
@@ -194,6 +230,9 @@ std::array<uint8_t, 32> Sha256::compute(const void* data, size_t len) {
 }
 
 void IntegrityBuilder::update(const void* data, size_t len) {
+    if (len > (std::numeric_limits<uint64_t>::max)() - bytes_) {
+        throw_error(ErrKind::Capacity, "integrity byte count overflow");
+    }
     crc_.update(data, len);
     sha_.update(data, len);
     bytes_ += len;
@@ -214,7 +253,7 @@ IntegrityId IntegrityBuilder::finish() {
     IntegrityId id;
     id.crc32c = crc_.value();
     id.sha = compute_sha_fingerprint(sha_);
-    id.bytes = static_cast<uint32_t>(bytes_);
+    id.bytes = bytes_;
     return id;
 }
 

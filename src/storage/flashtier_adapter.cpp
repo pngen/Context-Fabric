@@ -2,9 +2,9 @@
 
 namespace ctf {
 
-// By default no FlashTier adapter is linked; Context Fabric is fully
-// functional without it. A sibling repository may supply a real implementation
-// of FlashTierResidency and this factory.
+// This repository exposes the interface boundary only. Configuration fails
+// explicitly if FlashTier integration is requested, so returning nullptr here
+// cannot silently downgrade an enabled build.
 FlashTierResidency* create_flashtier_adapter() {
     return nullptr;
 }

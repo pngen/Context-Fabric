@@ -21,7 +21,7 @@ struct ReusePolicy {
     double time_weight = 1.0;        // relative weight of wall-clock time
     double resource_weight = 1.0;    // relative weight of resource cost
     double bandwidth_ref_bps = 1e9;  // reference bandwidth for cost normalization
-    uint64_t expected_reuses = 1;    // expected number of future uses
+    uint64_t expected_reuses = 1;    // expected uses at the target (must be at least one)
 };
 
 class TransferVsRecompute {
@@ -29,7 +29,8 @@ public:
     TransferVsRecompute() = default;
     explicit TransferVsRecompute(ReusePolicy policy) : policy_(policy) {}
 
-    // bandiwdth_bps is the measured path bandwidth current_node->target_node.
+    // bandwidth_bps is the measured path bandwidth current_node->target_node;
+    // zero explicitly selects bandwidth_ref_bps when no measurement exists.
     // Returns a PlacementDecision whose `location` is the target node and whose
     // `chose_transfer` indicates whether fetching the state is cheaper than
     // recomputing it. `reason` explains the choice.

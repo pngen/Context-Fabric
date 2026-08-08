@@ -13,8 +13,9 @@ namespace ctf {
 //
 // Launches a real coordinator process plus N real node processes on one
 // machine using localhost TCP, waits for registration, runs a workload, and
-// shuts everything down gracefully. This is the primary distributed proof:
-// the nodes are independent OS processes, not in-process objects.
+// shuts the nodes down through the control plane, and deterministically reaps
+// the complete owned process trees. The nodes are independent OS processes,
+// not in-process objects.
 // ---------------------------------------------------------------------------
 struct FabricLauncher {
     struct Config {
@@ -30,13 +31,10 @@ struct FabricLauncher {
 
     // Runs the whole fabric and returns a process exit code.
     int run(const Config& cfg);
-
-private:
-    std::string exe_path(const std::string& argv0_hint) const;
 };
 
-// Benchmark runner used by `context-fabric benchmark`. When `have_coord` is
-// false, it launches a temporary fabric itself.
-int run_benchmarks(const Args& args, const std::string& host, uint16_t port, bool have_coord);
+// Benchmark runner used by `context-fabric benchmark`. Each runtime case owns
+// an isolated in-process coordinator and node set.
+int run_benchmarks(const Args& args);
 
 }  // namespace ctf

@@ -1,5 +1,6 @@
 #include "test_harness.h"
 
+#include <limits>
 #include <vector>
 
 #include "context_fabric/placement/placement_engine.h"
@@ -97,6 +98,47 @@ CF_TEST(placement_cost_aware_prefers_staying) {
     current.domain = StorageDomain::HostMemory;
     auto d = engine.decide(md, current, cands, "cost-aware");
     CF_CHECK(d.location.node_id == 2);
+    CF_CHECK(d.transfer.expected_seconds == 0.0);
+}
+
+CF_TEST(placement_capacity_arithmetic_cannot_wrap) {
+    PlacementEngine engine;
+    auto md = meta_with(16, 1.0, 0.0);
+    auto cands = candidates(1000, 1000, 1000, 1000);
+    cands[0].used_bytes = std::numeric_limits<uint64_t>::max() - 8;
+    auto d = engine.decide(md, Location(), cands, "baseline");
+    CF_CHECK(d.location.node_id == 2);
+}
+
+CF_TEST(placement_current_location_needs_no_duplicate_capacity) {
+    PlacementEngine engine;
+    auto md = meta_with(1000, 1.0, 0.0);
+    auto cands = candidates(0, 1000, 0, 1000);
+    Location current;
+    current.node_id = 2;
+    current.domain = StorageDomain::HostMemory;
+    auto d = engine.decide(md, current, cands, "baseline");
+    CF_CHECK(d.location.node_id == 2);
+}
+
+CF_TEST(placement_rejects_non_finite_metrics) {
+    PlacementEngine engine;
+    auto md = meta_with(1000, 1.0, 0.0);
+    auto cands = candidates(1000, 1000, 1000, 1000);
+    cands[0].bandwidth_bps = std::numeric_limits<double>::quiet_NaN();
+    CF_CHECK_THROWS(engine.decide(md, Location(), cands, "cost-aware"), ErrKind::InvalidArgument);
+}
+
+CF_TEST(placement_rejects_invalid_candidate_and_metadata) {
+    PlacementEngine engine;
+    auto md = meta_with(1000, 1.0, 0.0);
+    auto cands = candidates(1000, 1000, 1000, 1000);
+    cands[0].location.node_id = 0;
+    CF_CHECK_THROWS(engine.decide(md, Location(), cands, "baseline"), ErrKind::InvalidArgument);
+
+    cands = candidates(1000, 1000, 1000, 1000);
+    md.reuse_probability = 1.01;
+    CF_CHECK_THROWS(engine.decide(md, Location(), cands, "cost-aware"), ErrKind::InvalidArgument);
 }
 
 CF_TEST(transfer_vs_recompute_cheap_recompute) {
@@ -144,4 +186,38 @@ CF_TEST(transfer_vs_recompute_hot_state_prefers_transfer) {
     TransferVsRecompute hot(ReusePolicy{1.0, 1.0, 1e9, 100});  // 100 expected reuses
     auto d = hot.decide(md, 1, 2, 1e9);
     CF_CHECK(d.chose_transfer);
+}
+
+CF_TEST(transfer_vs_recompute_rejects_invalid_numeric_inputs) {
+    TransferVsRecompute planner;
+    ContextMetadata md;
+    md.byte_size = 1024;
+    md.recompute_seconds = 1.0;
+    CF_CHECK_THROWS(planner.decide(md, 1, 2, -1.0), ErrKind::InvalidArgument);
+    CF_CHECK_THROWS(planner.decide(md, 1, 2, std::numeric_limits<double>::quiet_NaN()),
+                    ErrKind::InvalidArgument);
+    TransferVsRecompute zero_reuses(ReusePolicy{1.0, 1.0, 1e9, 0});
+    CF_CHECK_THROWS(zero_reuses.decide(md, 1, 2, 1e9), ErrKind::InvalidArgument);
+}
+
+CF_TEST(transfer_vs_recompute_discloses_reference_bandwidth_fallback) {
+    TransferVsRecompute planner;
+    ContextMetadata md;
+    md.byte_size = 1024;
+    md.recompute_seconds = 1.0;
+    auto d = planner.decide(md, 1, 2, 0.0);
+    CF_CHECK(d.reason.find("reference") != std::string::npos);
+}
+
+CF_TEST(transfer_vs_recompute_same_node_has_no_transfer_cost) {
+    TransferVsRecompute planner;
+    ContextMetadata md;
+    md.byte_size = 100ull * 1024 * 1024;
+    md.recompute_seconds = 0.001;
+    auto d = planner.decide(md, 7, 7, 1.0);
+    CF_CHECK(d.chose_transfer);
+    CF_CHECK(d.transfer.expected_seconds == 0.0);
+    CF_CHECK(d.transfer.expected_bytes == 0.0);
+    CF_CHECK(d.transfer.resource_cost == 0.0);
+    CF_CHECK_THROWS(planner.decide(md, 0, 7, 1e9), ErrKind::InvalidArgument);
 }

@@ -14,8 +14,8 @@ using namespace ctf;
 namespace {
 
 struct TestCoordinator {
-    Coordinator coord;
     Telemetry telemetry;
+    Coordinator coord;
 
     TestCoordinator() : coord(make_cfg(), telemetry) {
         telemetry.set_stderr_enabled(false);

@@ -56,6 +56,8 @@ public:
         size_t max_connections = 64;
         size_t driver_threads = 4;
         size_t queue_capacity = 2048;
+        size_t queue_byte_capacity = 64u * 1024 * 1024;
+        uint32_t max_control_payload_bytes = 4u * 1024 * 1024;
     };
 
     Coordinator(Config cfg, Telemetry& telemetry);
@@ -82,6 +84,7 @@ public:
 private:
     struct Conn;
     struct PendingOp;
+    struct ReaderThread;
 
     // Work items consumed by driver threads.
     struct WorkItem {
@@ -92,6 +95,7 @@ private:
     };
 
     void accept_loop();
+    void reap_reader_threads();
     void reader_loop(std::shared_ptr<Conn> conn);
     void driver_loop();
     void sweep_loop();
@@ -145,13 +149,14 @@ private:
     void abort_pending_op(std::shared_ptr<PendingOp> op, const std::string& reason);
 
     // Node disconnect cleanup.
-    void node_disconnected(uint64_t node_id);
+    void node_disconnected(uint64_t node_id, uint64_t expected_conn_id = 0);
 
     // Recovery at startup.
     void reconcile_at_startup();
 
     void persist_if_dirty();
     void mark_dirty();
+    uint64_t next_sequence();  // caller holds state_mutex_
 
     // Telemetry emit helper.
     void emit(const std::string& event, const JsonObject& doc);
@@ -161,19 +166,21 @@ private:
 
     std::atomic<bool> running_{false};
     std::atomic<uint16_t> bound_port_{0};
+    std::mutex lifecycle_mutex_;
 
     // Networking.
     Socket listener_;
     std::thread accept_thread_;
     std::thread sweep_thread_;
     std::vector<std::thread> driver_threads_;
-    std::vector<std::thread> reader_threads_;
+    std::vector<std::unique_ptr<ReaderThread>> reader_threads_;
 
     // Work queue.
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::deque<WorkItem> queue_;
     size_t queue_size_ = 0;
+    size_t queue_bytes_ = 0;
 
     // State (guarded by state_mutex_).
     std::mutex state_mutex_;
@@ -182,7 +189,7 @@ private:
     std::mutex conn_mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<Conn>> conns_;          // conn_id -> conn
     std::unordered_map<uint64_t, uint64_t> node_conns_;                  // node_id -> conn_id
-    uint32_t epoch_ = 0;
+    std::atomic<uint32_t> epoch_{0};
     uint64_t seq_ = 0;
     uint64_t conn_next_id_ = 1;
     std::map<uint64_t, CoordNode> nodes_;          // node_id -> node
@@ -196,13 +203,17 @@ private:
 
     // Idempotency cache (bounded). key = (conn_id, request_id).
     struct IdemEntry {
-        uint64_t key = 0;
-        MessageType type = 0;
+        uint64_t conn_id = 0;
+        uint64_t request_id = 0;
+        MessageType request_type = 0;
+        uint32_t request_payload_len = 0;
+        uint32_t request_payload_crc = 0;
+        MessageType response_type = 0;
         std::vector<uint8_t> payload;
     };
     std::mutex idem_mutex_;
     std::deque<IdemEntry> idem_cache_;
-    std::unordered_map<uint64_t, size_t> idem_index_;  // key -> position in deque
+    std::map<std::pair<uint64_t, uint64_t>, size_t> idem_index_;
 
     CoordinatorStore store_;
 };

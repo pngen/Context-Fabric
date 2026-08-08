@@ -19,7 +19,7 @@ extern "C" __global__ void cf_device_sum_checksum(const uint8_t* data, uint64_t 
 
 extern "C" void cf_launch_sum_checksum(const uint8_t* data, uint64_t size, uint64_t* out, void* stream) {
     if (size == 0) return;
-    uint64_t blocks = (size + 255) / 256;
+    uint64_t blocks = size / 256 + (size % 256 != 0 ? 1 : 0);
     if (blocks > 1024) blocks = 1024;
     cf_device_sum_checksum<<<static_cast<unsigned>(blocks), 256, 0, static_cast<cudaStream_t>(stream)>>>(
         data, size, out);

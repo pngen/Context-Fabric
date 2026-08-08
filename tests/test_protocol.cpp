@@ -1,5 +1,6 @@
 #include "test_harness.h"
 
+#include <limits>
 #include <vector>
 
 #include "context_fabric/protocol/messages.h"
@@ -152,4 +153,49 @@ CF_TEST(protocol_malformed_rejected) {
     std::vector<uint8_t> truncated(w.data().begin(), w.data().begin() + static_cast<std::ptrdiff_t>(w.size() - 2));
     Reader r(truncated.data(), truncated.size());
     CF_CHECK_THROWS(deserialize_data_block(r), ErrKind::Protocol);
+
+    // Boolean fields and enum values must use their canonical encodings.
+    Writer bad_result_bool;
+    bad_result_bool.u8(2);
+    bad_result_bool.u32(static_cast<uint32_t>(ErrKind::None));
+    bad_result_bool.u64(0);
+    bad_result_bool.str("");
+    Reader result_bool_reader(bad_result_bool.data().data(), bad_result_bool.size());
+    CF_CHECK_THROWS(deserialize_result(result_bool_reader), ErrKind::Protocol);
+
+    Writer bad_error_kind;
+    bad_error_kind.u8(0);
+    bad_error_kind.u32((std::numeric_limits<uint32_t>::max)());
+    bad_error_kind.u64(0);
+    bad_error_kind.str("failure");
+    Reader error_kind_reader(bad_error_kind.data().data(), bad_error_kind.size());
+    CF_CHECK_THROWS(deserialize_result(error_kind_reader), ErrKind::Protocol);
+
+    Writer bad_verify_bool;
+    bad_verify_bool.u64(1);
+    bad_verify_bool.u64(2);
+    bad_verify_bool.u64(3);
+    bad_verify_bool.u8(2);
+    Reader verify_bool_reader(bad_verify_bool.data().data(), bad_verify_bool.size());
+    CF_CHECK_THROWS(deserialize_verify(verify_bool_reader), ErrKind::Protocol);
+
+    Writer bad_domain;
+    bad_domain.u64(1);
+    bad_domain.u64(2);
+    bad_domain.u64(3);
+    bad_domain.u32((std::numeric_limits<uint32_t>::max)());
+    bad_domain.u8(0);
+    Reader domain_reader(bad_domain.data().data(), bad_domain.size());
+    CF_CHECK_THROWS(deserialize_migrate(domain_reader), ErrKind::Protocol);
+
+    RpcResult inconsistent = RpcResult::success();
+    inconsistent.err = ErrKind::Integrity;
+    Writer inconsistent_writer;
+    CF_CHECK_THROWS(serialize_result(inconsistent_writer, inconsistent), ErrKind::InvalidArgument);
+
+    DecisionQueryResp nonfinite;
+    nonfinite.result = RpcResult::success();
+    nonfinite.decision.score = (std::numeric_limits<double>::quiet_NaN)();
+    Writer nonfinite_writer;
+    CF_CHECK_THROWS(serialize_decision_query_resp(nonfinite_writer, nonfinite), ErrKind::InvalidArgument);
 }

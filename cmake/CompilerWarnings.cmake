@@ -1,10 +1,8 @@
 # Per-compiler warning policy for project-owned code.
 #
 # All project-owned translation units build with an aggressive warning set.
-# When CONTEXT_FABRIC_WARNINGS_AS_ERRORS is ON (the default for release-shaped
-# configurations) warnings are promoted to errors.
-
-set(_CF_WARN_TARGETS "")
+# When CONTEXT_FABRIC_WARNINGS_AS_ERRORS is ON, warnings are promoted to
+# errors for both C++ and CUDA project-owned translation units.
 
 function(context_fabric_enable_warnings target)
   if(MSVC)
@@ -29,8 +27,11 @@ function(context_fabric_enable_cuda_warnings target)
   endif()
   if(MSVC)
     target_compile_options(${target} PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W4>
-      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/WX>)
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W4>)
+    if(CONTEXT_FABRIC_WARNINGS_AS_ERRORS)
+      target_compile_options(${target} PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/WX>)
+    endif()
     # MSVC's own intrinsics headers and host compiler emit some harmless
     # "unreferenced local function" / name-lookup noise under nvcc; those are
     # toolchain artifacts, not project-owned warnings.
@@ -40,5 +41,9 @@ function(context_fabric_enable_cuda_warnings target)
     target_compile_options(${target} PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall>
       $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wextra>)
+    if(CONTEXT_FABRIC_WARNINGS_AS_ERRORS)
+      target_compile_options(${target} PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Werror>)
+    endif()
   endif()
 endfunction()

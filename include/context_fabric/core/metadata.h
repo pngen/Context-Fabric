@@ -58,7 +58,7 @@ struct ContextMetadata {
     uint64_t compatibility_fingerprint = 0;
 
     [[nodiscard]] bool compatible_with(const ContextMetadata& other) const noexcept;
-    [[nodiscard]] uint64_t compute_compatibility_fingerprint() const noexcept;
+    [[nodiscard]] uint64_t compute_compatibility_fingerprint() const;
 
     // Serialization (deterministic binary form used on the wire and on disk).
     void serialize(std::vector<uint8_t>& out) const;

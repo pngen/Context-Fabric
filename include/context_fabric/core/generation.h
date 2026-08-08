@@ -24,7 +24,7 @@ public:
     [[nodiscard]] bool valid() const noexcept { return value_ != 0; }
     [[nodiscard]] uint64_t value() const noexcept { return value_; }
 
-    [[nodiscard]] Generation next() const noexcept { return Generation(value_ + 1); }
+    [[nodiscard]] Generation next() const;
     [[nodiscard]] std::string to_hex() const;
 
     friend bool operator==(const Generation& a, const Generation& b) noexcept {

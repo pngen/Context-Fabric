@@ -37,8 +37,11 @@ bool parse_byte_size(const std::string& s, uint64_t& out) {
 
     // Optional fractional part (e.g. "1.5GiB")
     double frac = 0.0;
+    bool has_fraction = false;
     if (i < s.size() && s[i] == '.') {
+        has_fraction = true;
         ++i;
+        if (i >= s.size() || !std::isdigit(static_cast<unsigned char>(s[i]))) return false;
         double place = 0.1;
         while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
             frac += static_cast<double>(s[i] - '0') * place;
@@ -49,6 +52,7 @@ bool parse_byte_size(const std::string& s, uint64_t& out) {
 
     while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
     if (i >= s.size()) {
+        if (has_fraction) return false;  // unitless sizes are strict integers
         out = value;
         return true;
     }
@@ -56,6 +60,8 @@ bool parse_byte_size(const std::string& s, uint64_t& out) {
     std::string unit;
     unit.reserve(4);
     while (i < s.size() && !std::isspace(static_cast<unsigned char>(s[i]))) unit.push_back(s[i++]);
+    while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
+    if (i != s.size()) return false;
     for (auto& c : unit) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
 
     uint64_t mult = 1;

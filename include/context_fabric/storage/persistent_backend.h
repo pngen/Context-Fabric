@@ -4,7 +4,7 @@
 #include <string>
 #include <mutex>
 #include <vector>
-#include <set>
+#include <map>
 
 #include "context_fabric/storage/storage_backend.h"
 #include "context_fabric/core/metadata.h"
@@ -68,7 +68,7 @@ private:
     std::string root_;
     std::string objects_dir_;
     std::string quarantine_dir_;
-    std::set<CopyKey> catalog_;
+    std::map<CopyKey, uint64_t> catalog_;  // exact accounted on-disk bytes per record
     uint64_t capacity_;
     uint64_t used_ = 0;
     uint64_t high_water_ = 0;

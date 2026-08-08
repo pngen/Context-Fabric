@@ -27,8 +27,13 @@ FrameHeader TransportConnection::recv(std::vector<uint8_t>& payload) {
     return recv_frame(sock_, payload, read_timeout_ms_);
 }
 
+void TransportConnection::set_timeouts(uint64_t read_timeout_ms, uint64_t write_timeout_ms) noexcept {
+    read_timeout_ms_ = read_timeout_ms;
+    write_timeout_ms_ = write_timeout_ms;
+}
+
 void TransportConnection::close() {
-    sock_.shutdown_send();
+    sock_.shutdown_both();
     sock_.close();
 }
 
@@ -49,6 +54,9 @@ TransportConnection TransportListener::accept() {
     return TransportConnection(std::string("peer"), std::move(s), read_timeout_ms_, write_timeout_ms_);
 }
 
-void TransportListener::close() { sock_.close(); }
+void TransportListener::close() {
+    sock_.shutdown_both();
+    sock_.close();
+}
 
 }  // namespace ctf
