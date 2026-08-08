@@ -1233,8 +1233,9 @@ void Coordinator::handle_data_result(const std::shared_ptr<Conn>& conn, uint64_t
         bool commit_ready;
         if (op->kind == "persist" || op->kind == "create" || op->kind == "write") {
             commit_ready = op->receiver_done != 0;
-        } else if (op->kind == "migrate" && op->source_node == op->target_node) {
-            // Same-node domain migration: the single participant reports once.
+        } else if (op->source_node == op->target_node) {
+            // Same-node transfer (domain migration / self-load restore): the
+            // single participant reports once.
             commit_ready = op->receiver_done != 0;
         } else {
             commit_ready = op->receiver_done != 0 && (op->sender_done != 0 || op->kind == "replicate");
@@ -1782,7 +1783,6 @@ void Coordinator::handle_persist(const std::shared_ptr<Conn>& conn, uint64_t req
     JsonObject doc;
     doc.field("id", req.object_id.to_hex());
     emit("persist.committed", doc);
-
     send_to_conn(conn, kMsgPersistResp, req_id, payload);
 }
 
@@ -1794,7 +1794,6 @@ void Coordinator::handle_restore(const std::shared_ptr<Conn>& conn, uint64_t req
     JsonObject doc;
     doc.field("id", req.object_id.to_hex());
     emit("restore.committed", doc);
-
     send_to_conn(conn, kMsgRestoreResp, req_id, payload);
 }
 
@@ -1824,6 +1823,7 @@ void Coordinator::handle_verify(const std::shared_ptr<Conn>& conn, uint64_t req_
         op->generation = gen;
         op->kind = "verify";
         op->target_node = node;
+        op->created_ms = now_unix_ms();
         op->timeout_ms = cfg_.op_timeout_ms;
         pending_ops_[op_token] = op;
     }

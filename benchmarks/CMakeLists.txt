@@ -1,6 +1,15 @@
-add_executable(context_fabric_benchmarks
+add_library(context_fabric_benchsuite STATIC
+  bench_suite.cpp
+)
+target_include_directories(context_fabric_benchsuite PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_include_directories(context_fabric_benchsuite PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(context_fabric_benchsuite PUBLIC context_fabric)
+context_fabric_enable_warnings(context_fabric_benchsuite)
+
+add_executable(context_fabric_bench
   bench_main.cpp
 )
-target_include_directories(context_fabric_benchmarks PRIVATE ${PROJECT_SOURCE_DIR}/include)
-target_link_libraries(context_fabric_benchmarks PRIVATE context_fabric)
-context_fabric_enable_warnings(context_fabric_benchmarks)
+target_include_directories(context_fabric_bench PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_include_directories(context_fabric_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(context_fabric_bench PRIVATE context_fabric_benchsuite)
+context_fabric_enable_warnings(context_fabric_bench)
