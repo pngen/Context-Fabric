@@ -1,0 +1,15 @@
+Context Fabric
+Copyright 2026 Context Fabric contributors
+
+This product includes software developed by the Context Fabric contributors.
+
+Context Fabric is an independent project. It is not affiliated with, endorsed
+by, or a fork of LMCache, Mooncake, NVIDIA Dynamo, vLLM, SGLang, Redis, Ray,
+or any other inference-serving cache or distributed data system.
+
+FlashTier is a separate sibling project. Context Fabric defines an optional
+adapter boundary for delegating node-local physical residency management to
+FlashTier, but Context Fabric does not contain FlashTier source code and does
+not require FlashTier to build or run.
+
+This product uses the Apache License 2.0. See LICENSE.

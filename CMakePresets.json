@@ -1,0 +1,114 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "cpu-release",
+      "displayName": "CPU-only release build",
+      "description": "Release build without CUDA. Compiles and runs tests, benchmarks and examples without a CUDA toolkit.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/cpu-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CONTEXT_FABRIC_ENABLE_CUDA": "OFF",
+        "CONTEXT_FABRIC_BUILD_TESTS": "ON",
+        "CONTEXT_FABRIC_BUILD_BENCHMARKS": "ON",
+        "CONTEXT_FABRIC_BUILD_EXAMPLES": "ON",
+        "CONTEXT_FABRIC_BUILD_CLI": "ON",
+        "CONTEXT_FABRIC_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "cpu-debug",
+      "displayName": "CPU-only debug build",
+      "description": "Debug build without CUDA.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/cpu-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CONTEXT_FABRIC_ENABLE_CUDA": "OFF",
+        "CONTEXT_FABRIC_BUILD_TESTS": "ON",
+        "CONTEXT_FABRIC_BUILD_BENCHMARKS": "ON",
+        "CONTEXT_FABRIC_BUILD_EXAMPLES": "ON",
+        "CONTEXT_FABRIC_BUILD_CLI": "ON",
+        "CONTEXT_FABRIC_WARNINGS_AS_ERRORS": "OFF"
+      }
+    },
+    {
+      "name": "cuda-release",
+      "displayName": "CUDA-enabled release build",
+      "description": "Release build with the CUDA accelerator backend enabled.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/cuda-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CONTEXT_FABRIC_ENABLE_CUDA": "ON",
+        "CONTEXT_FABRIC_BUILD_TESTS": "ON",
+        "CONTEXT_FABRIC_BUILD_BENCHMARKS": "ON",
+        "CONTEXT_FABRIC_BUILD_EXAMPLES": "ON",
+        "CONTEXT_FABRIC_BUILD_CLI": "ON",
+        "CONTEXT_FABRIC_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "cuda-debug",
+      "displayName": "CUDA-enabled debug build",
+      "description": "Debug build with the CUDA accelerator backend enabled.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/cuda-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CONTEXT_FABRIC_ENABLE_CUDA": "ON",
+        "CONTEXT_FABRIC_BUILD_TESTS": "ON",
+        "CONTEXT_FABRIC_BUILD_BENCHMARKS": "ON",
+        "CONTEXT_FABRIC_BUILD_EXAMPLES": "ON",
+        "CONTEXT_FABRIC_BUILD_CLI": "ON",
+        "CONTEXT_FABRIC_WARNINGS_AS_ERRORS": "OFF"
+      }
+    },
+    {
+      "name": "cpu-tests",
+      "displayName": "CPU-only focused test build",
+      "description": "Minimal CPU-only build for fast test iteration.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/cpu-tests",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CONTEXT_FABRIC_ENABLE_CUDA": "OFF",
+        "CONTEXT_FABRIC_BUILD_TESTS": "ON",
+        "CONTEXT_FABRIC_BUILD_BENCHMARKS": "OFF",
+        "CONTEXT_FABRIC_BUILD_EXAMPLES": "OFF",
+        "CONTEXT_FABRIC_BUILD_CLI": "ON",
+        "CONTEXT_FABRIC_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "cuda-tests",
+      "displayName": "CUDA focused test build",
+      "description": "Minimal CUDA-enabled build for fast test iteration.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/cuda-tests",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CONTEXT_FABRIC_ENABLE_CUDA": "ON",
+        "CONTEXT_FABRIC_BUILD_TESTS": "ON",
+        "CONTEXT_FABRIC_BUILD_BENCHMARKS": "OFF",
+        "CONTEXT_FABRIC_BUILD_EXAMPLES": "OFF",
+        "CONTEXT_FABRIC_BUILD_CLI": "ON",
+        "CONTEXT_FABRIC_WARNINGS_AS_ERRORS": "ON"
+      }
+    }
+  ],
+  "testPresets": [
+    { "name": "cpu-release", "configurePreset": "cpu-release", "output": { "outputOnFailure": true } },
+    { "name": "cpu-debug", "configurePreset": "cpu-debug", "output": { "outputOnFailure": true } },
+    { "name": "cuda-release", "configurePreset": "cuda-release", "output": { "outputOnFailure": true } },
+    { "name": "cuda-debug", "configurePreset": "cuda-debug", "output": { "outputOnFailure": true } },
+    { "name": "cpu-tests", "configurePreset": "cpu-tests", "output": { "outputOnFailure": true } },
+    { "name": "cuda-tests", "configurePreset": "cuda-tests", "output": { "outputOnFailure": true } }
+  ]
+}

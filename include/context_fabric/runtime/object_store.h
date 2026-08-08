@@ -1,0 +1,71 @@
+#pragma once
+
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "context_fabric/core/object_id.h"
+#include "context_fabric/core/generation.h"
+#include "context_fabric/core/types.h"
+#include "context_fabric/core/integrity.h"
+#include "context_fabric/storage/storage_backend.h"
+#include "context_fabric/storage/host_memory_backend.h"
+#include "context_fabric/storage/persistent_backend.h"
+#include "context_fabric/storage/accelerator_backend.h"
+
+namespace ctf {
+
+// ---------------------------------------------------------------------------
+// NodeObjectStore: tracks which physical copies this node holds and their
+// role (authoritative / replica / persistent) and integrity identity. The
+// backends hold the bytes; this store holds the role metadata.
+// ---------------------------------------------------------------------------
+struct LocalCopy {
+    CopyRole role = CopyRole::None;
+    StorageDomain domain = StorageDomain::Unknown;
+    IntegrityId integrity;
+};
+
+class NodeObjectStore {
+public:
+    NodeObjectStore() = default;
+
+    void set_host(HostMemoryBackend* host) { host_ = host; }
+    void set_persistent(LocalPersistentBackend* persistent) { persistent_ = persistent; }
+    void set_accelerator(AcceleratorBackend* accelerator) { accelerator_ = accelerator; }
+
+    // Store bytes into the given domain and record the copy role.
+    void store(const ObjectId& id, const Generation& gen, CopyRole role, StorageDomain domain,
+               const ContextMetadata* metadata, const uint8_t* data, uint64_t size);
+
+    // Read bytes for a transfer from whatever backend holds the copy.
+    std::vector<uint8_t> read(const ObjectId& id, const Generation& gen) const;
+
+    // Verify a resident copy against the store's recorded integrity.
+    void verify(const ObjectId& id, const Generation& gen, uint64_t expected_crc, uint64_t expected_sha);
+
+    void set_role(const ObjectId& id, const Generation& gen, CopyRole role);
+    void remove(const ObjectId& id, const Generation& gen);
+    void remove_domain(const ObjectId& id, const Generation& gen, StorageDomain domain);
+
+    [[nodiscard]] bool has_copy(const ObjectId& id, const Generation& gen) const;
+    [[nodiscard]] bool has_role(const ObjectId& id, const Generation& gen, CopyRole role) const;
+    [[nodiscard]] CopyRole role_of(const ObjectId& id, const Generation& gen) const;
+    [[nodiscard]] std::vector<CopyKey> all_copies() const;
+
+    // Account usage.
+    [[nodiscard]] uint64_t host_used() const;
+    [[nodiscard]] uint64_t persistent_used() const;
+    [[nodiscard]] uint64_t accelerator_used() const;
+
+private:
+    mutable std::mutex mutex_;
+    std::unordered_map<CopyKey, LocalCopy> copies_;
+    HostMemoryBackend* host_ = nullptr;
+    LocalPersistentBackend* persistent_ = nullptr;
+    AcceleratorBackend* accelerator_ = nullptr;
+};
+
+}  // namespace ctf

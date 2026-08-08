@@ -1,0 +1,37 @@
+# Build directories
+/build/
+build/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+*.cmake.tmp
+compile_commands.json
+
+# Object/executable files
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.dmp
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+
+# Test / temp artifacts
+*.tmp
+*.log
+crash.dmp
+
+# Local scratch
+asan_t.*
+dbg_*

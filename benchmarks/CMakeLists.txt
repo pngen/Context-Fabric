@@ -1,0 +1,6 @@
+add_executable(context_fabric_benchmarks
+  bench_main.cpp
+)
+target_include_directories(context_fabric_benchmarks PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(context_fabric_benchmarks PRIVATE context_fabric)
+context_fabric_enable_warnings(context_fabric_benchmarks)

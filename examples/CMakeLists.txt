@@ -1,0 +1,23 @@
+add_executable(example_minimal_object minimal_object.cpp)
+target_link_libraries(example_minimal_object PRIVATE context_fabric)
+context_fabric_enable_warnings(example_minimal_object)
+
+add_executable(example_local_multi_node local_multi_node.cpp)
+target_link_libraries(example_local_multi_node PRIVATE context_fabric)
+context_fabric_enable_warnings(example_local_multi_node)
+
+add_executable(example_migrate_state migrate_state.cpp)
+target_link_libraries(example_migrate_state PRIVATE context_fabric)
+context_fabric_enable_warnings(example_migrate_state)
+
+add_executable(example_persistent_state persistent_state.cpp)
+target_link_libraries(example_persistent_state PRIVATE context_fabric)
+context_fabric_enable_warnings(example_persistent_state)
+
+add_executable(example_cuda_state cuda_state.cpp)
+target_link_libraries(example_cuda_state PRIVATE context_fabric)
+context_fabric_enable_warnings(example_cuda_state)
+
+add_executable(example_reuse_vs_recompute reuse_vs_recompute.cpp)
+target_link_libraries(example_reuse_vs_recompute PRIVATE context_fabric)
+context_fabric_enable_warnings(example_reuse_vs_recompute)
