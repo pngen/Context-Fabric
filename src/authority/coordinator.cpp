@@ -459,21 +459,30 @@ void Coordinator::request_shutdown() {
 
 void Coordinator::shutdown() {
     request_shutdown();
-    if (accept_thread_.joinable()) accept_thread_.join();
+    if (accept_thread_.joinable()) {
+        accept_thread_.join();
+    }
     for (auto& t : driver_threads_) {
-        if (t.joinable()) t.join();
+        if (t.joinable()) {
+            t.join();
+        }
     }
     {
         std::lock_guard<std::mutex> lock(conn_mutex_);
         for (auto& [id, conn] : conns_) {
             conn->sock.shutdown_both();
+            conn->sock.close();
             conn->closed.store(true);
         }
     }
     for (auto& t : reader_threads_) {
-        if (t.joinable()) t.join();
+        if (t.joinable()) {
+            t.join();
+        }
     }
-    if (sweep_thread_.joinable()) sweep_thread_.join();
+    if (sweep_thread_.joinable()) {
+        sweep_thread_.join();
+    }
     persist_if_dirty();
     telemetry_.close();
 }

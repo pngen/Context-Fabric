@@ -84,5 +84,20 @@ int main(int argc, char** argv) {
     std::printf("replicas:");
     for (uint64_t r : ir.replica_nodes) std::printf(" %llu", static_cast<unsigned long long>(r));
     std::printf("\n");
+    std::fflush(stdout);
+
+    // Explicit, deterministic teardown.
+    for (auto& n : nodes) {
+        if (n) {
+            n->shutdown();
+            n.reset();
+        }
+    }
+    nodes.clear();
+    node_ts.clear();
+    if (coord) {
+        coord->shutdown();
+        coord.reset();
+    }
     return 0;
 }

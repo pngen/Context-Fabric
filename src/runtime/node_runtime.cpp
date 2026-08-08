@@ -145,7 +145,9 @@ void NodeRuntime::shutdown() {
         accept_thread_.join();
     }
     for (auto& t : worker_threads_) {
-        if (t.joinable()) t.join();
+        if (t.joinable()) {
+            t.join();
+        }
     }
     if (host_) host_->shutdown();
     if (persistent_) persistent_->shutdown();

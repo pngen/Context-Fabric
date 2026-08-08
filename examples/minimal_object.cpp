@@ -6,6 +6,9 @@
 // coordinator + one node so the example runs standalone.)
 
 #include <cstdio>
+#include <exception>
+#include <chrono>
+#include <thread>
 #include <filesystem>
 #include <memory>
 
@@ -82,20 +85,44 @@ int main(int argc, char** argv) {
     md.compatibility_fingerprint = md.compute_compatibility_fingerprint();
 
     auto content = generate_content(1, 1, 4096);
-    ObjectId id = cf.create_object(md, nid.value(), content);
-    std::printf("created object %s\n", id.to_hex().c_str());
+    try {
+        // Wait for the node to register before creating.
+        ObjectId id;
+        bool created = false;
+        for (int i = 0; i < 100 && !created; ++i) {
+            try {
+                id = cf.create_object(md, nid.value(), content);
+                created = true;
+            } catch (const CfError& e) {
+                if (e.kind() != ErrKind::NotFound && e.kind() != ErrKind::State) throw;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        if (!created) {
+            std::fprintf(stderr, "object creation did not complete\n");
+            return 1;
+        }
+        std::printf("created object %s\n", id.to_hex().c_str());
 
-    auto ir = cf.inspect(id);
-    std::printf("object class=%s namespace=%s bytes=%llu lifecycle=%s\n",
-                semantic_class_name(ir.metadata.semantic_class), ir.metadata.namespace_id.c_str(),
-                static_cast<unsigned long long>(ir.metadata.byte_size),
-                lifecycle_state_name(static_cast<LifecycleState>(ir.lifecycle)));
+        auto ir = cf.inspect(id);
 
-    auto vr = cf.verify(id, nid.value(), true);
-    std::printf("verify: %s (crc=%016llx)\n", vr.ok ? "OK" : "FAIL",
-                static_cast<unsigned long long>(vr.crc32c));
+        auto vr = cf.verify(id, nid.value(), true);
+        std::printf("verify: %s (crc=%016llx)\n", vr.ok ? "OK" : "FAIL",
+                    static_cast<unsigned long long>(vr.crc32c));
 
-    cf.remove(id);
-    std::printf("removed object\n");
+        cf.remove(id);
+        std::printf("removed object\n");
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "example error: %s\n", e.what());
+        return 1;
+    }
+    if (node) {
+        node->shutdown();
+        node.reset();
+    }
+    if (coord) {
+        coord->shutdown();
+        coord.reset();
+    }
     return 0;
 }

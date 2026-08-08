@@ -24,9 +24,12 @@ void Telemetry::open(const std::string& path) {
 }
 
 void Telemetry::close() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (!mutex_.try_lock()) {
+        return;
+    }
     if (file_.is_open()) file_.close();
     opened_ = false;
+    mutex_.unlock();
 }
 
 void Telemetry::emit(const std::string& event, const JsonObject& doc) {
