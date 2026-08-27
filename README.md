@@ -231,24 +231,6 @@ but this repository does not wire a concrete adapter. Context Fabric builds
 and runs without FlashTier; requesting the unwired integration fails at CMake
 configure time. See `ARCHITECTURE.md` for the exact boundary.
 
-## Current limitations
-
-- The v1 metadata coordinator is a single configured authority with durable
-  state, not a replicated consensus service. Its guarantees are documented in
-  `ARCHITECTURE.md`. The protocol is designed so a Raft/etcd-style backend can
-  replace it without changing ContextObject semantics.
-- Validation runs on one physical machine using multiple real processes over
-  localhost TCP. Multi-host validation is not yet performed.
-- Numeric IPv4 connection deadlines include address handling on every
-  platform, and Windows hostname lookup uses the same caller deadline. POSIX
-  hostname lookup uses the system `getaddrinfo` deadline; deployments that
-  require a strict end-to-end connect bound should configure numeric IPv4
-  endpoints.
-- RDMA, GPUDirect, CXL, object-store backends, and HIP/Level Zero/Metal
-  backends are future work, not current features.
-- No authentication/encryption is implemented; the trust model is an explicit
-  trusted-cluster network.
-
 ## License
 
-Apache License 2.0. See `LICENSE` and `NOTICE`.
+Apache License 2.0. Copyright 2026 Summon Software Labs. No telemetry transmission.
