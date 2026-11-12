@@ -228,8 +228,17 @@ void NodeRuntime::run() {
 
 void NodeRuntime::request_shutdown() {
     running_.store(false);
+    // Every waiter tests running_ while holding the mutex paired with its
+    // condition variable. Passing through that mutex after the store closes
+    // the window in which a waiter has evaluated its predicate but has not
+    // blocked yet; without it the notification is lost, the waiter sleeps
+    // forever (the worker queue wait is unbounded), and shutdown() never
+    // returns from joining it.
+    { std::lock_guard<std::mutex> lock(queue_mutex_); }
     queue_cv_.notify_all();
+    { std::lock_guard<std::mutex> lock(mutex_); }
     pending_cv_.notify_all();
+    { std::lock_guard<std::mutex> lock(shutdown_mutex_); }
     shutdown_cv_.notify_all();
     // Wakes threads blocked in recv/send on loopback sockets (closing the
     // handle from another thread does not reliably unblock them on Windows).

@@ -1,9 +1,11 @@
 #include "test_harness.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -280,6 +282,72 @@ CF_TEST(node_runtime_rejects_unserviceable_configs_and_restarts_cleanly) {
         CF_CHECK(elapsed < std::chrono::seconds(2));
         CF_CHECK(runtime.data_port() == 0);
     }
+}
+
+CF_TEST(node_runtime_shutdown_wakes_workers_that_are_entering_their_wait) {
+    // A peer that accepts and immediately hangs up makes every registration
+    // attempt fail fast, so each start/shutdown cycle is cheap. What remains
+    // under test is request_shutdown() racing a worker thread that has just
+    // evaluated its queue predicate: a notification sent without passing
+    // through the queue mutex is lost, the worker blocks forever, and
+    // shutdown() never returns from joining it.
+    Socket refusing_coordinator;
+    uint16_t port = 0;
+    CF_REQUIRE(refusing_coordinator.listen("127.0.0.1", 0, port));
+    std::atomic<bool> accepting{true};
+    std::thread acceptor([&] {
+        while (accepting.load()) {
+            Socket peer = refusing_coordinator.accept(50);
+            peer.close();
+        }
+    });
+
+    // The data-plane accept loop polls its listener in 200 ms slices that a
+    // listener shutdown does not interrupt on every platform. One connection
+    // per cycle, made while shutdown() runs, releases that poll so the cycles
+    // stay short. It never touches the condition variables under test: a
+    // connection accepted after shutdown began is dropped without a notify.
+    std::atomic<uint16_t> poke_port{0};
+    std::thread poker([&] {
+        while (accepting.load()) {
+            const uint16_t target = poke_port.exchange(0);
+            if (target == 0) {
+                std::this_thread::yield();
+                continue;
+            }
+            Socket poke;
+            (void)poke.connect("127.0.0.1", target, 20);
+        }
+    });
+
+    Telemetry telemetry;
+    telemetry.set_stderr_enabled(false);
+    NodeConfig config;
+    config.node_id = NodeId::deterministic("shutdown-wakeup-runtime");
+    config.coord_port = port;
+    config.host_capacity = 1024 * 1024;
+    config.transfer_workers = 1;
+    NodeRuntime runtime(config, telemetry);
+    constexpr int kCycles = 1000;
+    int completed = 0;
+    for (int cycle = 0; cycle < kCycles; ++cycle) {
+        if (!runtime.start()) break;
+        // Sweep a short gap between start() and shutdown() so that some
+        // cycles land on the instant the freshly started worker enters its
+        // wait.
+        const auto gap_end =
+            std::chrono::steady_clock::now() + std::chrono::microseconds((cycle % 60) * 5);
+        while (std::chrono::steady_clock::now() < gap_end) {
+        }
+        poke_port.store(runtime.data_port());
+        runtime.shutdown();
+        ++completed;
+    }
+    accepting.store(false);
+    acceptor.join();
+    poker.join();
+    CF_CHECK(completed == kCycles);
+    CF_CHECK(runtime.data_port() == 0);
 }
 
 CF_TEST(persistent_corruption_detected) {

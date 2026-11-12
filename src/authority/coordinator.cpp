@@ -572,6 +572,7 @@ bool Coordinator::start() {
     } catch (const std::exception& e) {
         fprintf(stderr, "coordinator: failure starting threads: %s\n", e.what());
         running_.store(false);
+        { std::lock_guard<std::mutex> lock(queue_mutex_); }  // see request_shutdown()
         queue_cv_.notify_all();
         listener_.shutdown_both();
         listener_.close();
@@ -595,6 +596,10 @@ void Coordinator::run() {
 
 void Coordinator::request_shutdown() {
     running_.store(false);
+    // run(), enqueue() and dequeue() test running_ under queue_mutex_. Passing
+    // through it after the store keeps the notification from being lost by a
+    // waiter that has evaluated its predicate but has not blocked yet.
+    { std::lock_guard<std::mutex> lock(queue_mutex_); }
     queue_cv_.notify_all();
     listener_.shutdown_both();
 }
@@ -1736,12 +1741,18 @@ void Coordinator::commit_pending_op(std::shared_ptr<PendingOp> op) {
         o.authoritative_node = op->target_node;
         o.authoritative_domain = op->target_domain;
         o.lease_generation += 1;  // ownership changed; old lease tokens invalid
+        // The copy that stays behind as a replica (or is disposed) is the one
+        // on the node the bytes were migrated from, i.e. the previous
+        // authoritative node. That is not owner_node once authority has moved
+        // by replica promotion or restore, and recording owner_node then
+        // lists a node without the bytes and omits the one that has them.
+        const uint64_t migrated_from = op->source_node;
         if (op->keep_source) {
-            if (std::find(o.replicas.begin(), o.replicas.end(), o.owner_node) == o.replicas.end()) {
-                o.replicas.push_back(o.owner_node);
+            if (std::find(o.replicas.begin(), o.replicas.end(), migrated_from) == o.replicas.end()) {
+                o.replicas.push_back(migrated_from);
             }
         } else {
-            o.replicas.erase(std::remove(o.replicas.begin(), o.replicas.end(), o.owner_node), o.replicas.end());
+            o.replicas.erase(std::remove(o.replicas.begin(), o.replicas.end(), migrated_from), o.replicas.end());
         }
         o.owner_node = op->target_node;
         o.lifecycle = LifecycleAuthority::transition(o.lifecycle, LifecycleState::Available);
@@ -1834,6 +1845,17 @@ void Coordinator::abort_pending_op(std::shared_ptr<PendingOp> op, const std::str
                 // Rollback restores the exact committed pre-operation state;
                 // no proposed transfer/write fields are durable state.
                 o.lifecycle = op->previous_lifecycle;
+                // The lease behind a leased pre-operation lifecycle may have
+                // been released, expired, or revoked while the operation was
+                // in flight. A leased lifecycle with no lease left would
+                // refuse every later lease request, so settle it the way
+                // lease release and expiry do.
+                const auto reads = read_leases_.find(op->object_id);
+                const bool read_held = reads != read_leases_.end() && !reads->second.empty();
+                if ((o.lifecycle == LifecycleState::LeasedWrite && write_leases_.count(op->object_id) == 0) ||
+                    (o.lifecycle == LifecycleState::LeasedRead && !read_held)) {
+                    o.lifecycle = LifecycleAuthority::transition(o.lifecycle, LifecycleState::Available);
+                }
             }
             mark_dirty();
             persist_if_dirty();
@@ -2491,12 +2513,21 @@ void Coordinator::node_disconnected(uint64_t node_id, uint64_t expected_conn_id)
     doc.field("node", node_id);
     emit("node.offline", doc);
 
-    // Abort any in-flight op involving this node.
+    // Abort any in-flight op involving this node. That includes an operation
+    // on an object whose authoritative copy lives on this node even when the
+    // node is neither the target nor the requested host (it is the transfer
+    // source, or a restore is replacing it): the recovery pass below skips
+    // in-flight objects, so letting such an operation run on would return the
+    // object to service with its authority still on an offline node.
     std::vector<uint64_t> ops_to_abort;
     for (auto& [token, op] : pending_ops_) {
-        if (op->target_node == node_id || op->on_node == node_id) {
-            ops_to_abort.push_back(token);
+        bool involved = op->target_node == node_id || op->on_node == node_id;
+        if (!involved) {
+            auto active = objects_.find(op->object_id);
+            involved = active != objects_.end() && active->second.active_op_token == token &&
+                       active->second.authoritative_node == node_id;
         }
+        if (involved) ops_to_abort.push_back(token);
     }
     for (uint64_t token : ops_to_abort) {
         auto it = pending_ops_.find(token);
@@ -2513,6 +2544,18 @@ void Coordinator::node_disconnected(uint64_t node_id, uint64_t expected_conn_id)
         if (leases.empty()) to_clean.push_back(oid);
     }
     for (auto& oid : to_clean) read_leases_.erase(oid);
+    // An object whose last read lease was just revoked must leave LeasedRead,
+    // exactly as it does when that lease is released or expires; otherwise
+    // every later lease request is refused. An in-flight operation settles
+    // the lifecycle itself when it commits or aborts.
+    for (auto& oid : to_clean) {
+        auto oit = objects_.find(oid);
+        if (oit != objects_.end() && !oit->second.in_flight() &&
+            oit->second.lifecycle == LifecycleState::LeasedRead) {
+            oit->second.lifecycle =
+                LifecycleAuthority::transition(oit->second.lifecycle, LifecycleState::Available);
+        }
+    }
 
     // Revoke write leases held by the node.
     std::vector<ObjectId> revoked_writes;
@@ -2526,6 +2569,10 @@ void Coordinator::node_disconnected(uint64_t node_id, uint64_t expected_conn_id)
         auto oit = objects_.find(oid);
         if (oit != objects_.end()) {
             oit->second.lease_generation += 1;
+            if (!oit->second.in_flight() && oit->second.lifecycle == LifecycleState::LeasedWrite) {
+                oit->second.lifecycle =
+                    LifecycleAuthority::transition(oit->second.lifecycle, LifecycleState::Available);
+            }
         }
     }
 

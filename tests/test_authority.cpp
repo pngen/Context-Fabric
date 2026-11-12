@@ -1,8 +1,12 @@
 #include "test_harness.h"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <memory>
 #include <thread>
+#include <vector>
 
 #include "context_fabric/api/context_fabric.h"
 #include "context_fabric/authority/client.h"
@@ -115,6 +119,100 @@ bool wait_until(F&& f, uint64_t timeout_ms, uint64_t step_ms = 50) {
     }
     return f();
 }
+
+// A node the coordinator believes is online but which never completes a
+// transfer: its data plane accepts a connection and hangs up without
+// acknowledging anything, and it never reports a result. An operation that
+// targets it stays in flight until this node's control session closes, which
+// makes the coordinator's handling of a disconnect during an in-flight
+// operation deterministic to test.
+struct SilentNode {
+    std::string name;
+    Socket data_listener;
+    uint16_t data_port = 0;
+    std::atomic<bool> accepting{true};
+    std::thread acceptor;
+    ClientSession control;
+
+    SilentNode(const std::string& node_name, uint16_t coord_port) : name(node_name) {
+        if (!data_listener.listen("127.0.0.1", 0, data_port)) {
+            throw CfError(ErrKind::Internal, "silent node data listener failed");
+        }
+        acceptor = std::thread([this] {
+            while (accepting.load()) {
+                Socket peer = data_listener.accept(50);
+                peer.close();
+            }
+        });
+        try {
+            if (!control.connect("127.0.0.1", coord_port, 5000)) {
+                throw CfError(ErrKind::Internal, "silent node control connect failed");
+            }
+            control.hello();
+            NodeRegisterReq reg;
+            reg.node_id = id();
+            reg.label = name;
+            reg.addr.host = "127.0.0.1";
+            reg.addr.port = data_port;
+            reg.capabilities = kCapHostMemory;
+            reg.max_host_bytes = 64ull * 1024 * 1024;
+            Writer w;
+            serialize_node_register(w, reg);
+            std::vector<uint8_t> payload;
+            control.call(kMsgNodeRegister, kMsgNodeRegisterResp, w.data(), payload);
+            Reader r(payload.data(), payload.size());
+            if (deserialize_node_register_resp(r).result.failed()) {
+                throw CfError(ErrKind::Internal, "silent node registration failed");
+            }
+        } catch (...) {
+            stop_acceptor();
+            throw;
+        }
+    }
+    ~SilentNode() {
+        disconnect();
+        stop_acceptor();
+    }
+
+    [[nodiscard]] uint64_t id() const { return NodeId::deterministic(name).value(); }
+    void disconnect() { control.close(); }
+    void stop_acceptor() {
+        accepting.store(false);
+        if (acceptor.joinable()) acceptor.join();
+    }
+};
+
+// Runs one blocking replicate request on its own control connection and
+// always joins, so a failed check can never leave a joinable thread behind.
+struct BlockedReplicate {
+    std::atomic<bool> failed{false};
+    std::thread thread;
+
+    BlockedReplicate(uint16_t coord_port, const ObjectId& id, uint64_t target) {
+        thread = std::thread([this, coord_port, id, target] {
+            try {
+                ContextFabric blocked;
+                if (!blocked.connect("127.0.0.1", coord_port, 5000)) {
+                    failed.store(true);
+                    return;
+                }
+                blocked.replicate(id, target);
+            } catch (const std::exception&) {
+                failed.store(true);
+            }
+        });
+    }
+    ~BlockedReplicate() { join(); }
+    void join() {
+        if (thread.joinable()) thread.join();
+    }
+};
+
+uint32_t lifecycle_of(ContextFabric& cf, const ObjectId& id) {
+    return cf.inspect(id).lifecycle;
+}
+
+constexpr uint32_t kAvailable = static_cast<uint32_t>(LifecycleState::Available);
 
 }  // namespace
 
@@ -412,4 +510,161 @@ CF_TEST(authority_placement_and_decision_queries) {
     auto dec = cf.decide_transfer_vs_recompute(md, node_a, node_b, 1e9);
     CF_CHECK(dec.policy == std::string("transfer-vs-recompute"));
     CF_CHECK(!dec.reason.empty());
+}
+
+CF_TEST(authority_source_disconnect_aborts_transfer_and_recovers_authority) {
+    TestCoordinator tc;
+    TestNode nb("src-loss-b", tc.port(), 64ull * 1024 * 1024, false);
+    auto na = std::make_unique<TestNode>("src-loss-a", tc.port(), 64ull * 1024 * 1024, false);
+    CF_REQUIRE(wait_until([&] { return tc.coord.online_node_count() == 2; }, 10000));
+    const uint64_t node_a = NodeId::deterministic("src-loss-a").value();
+    const uint64_t node_b = NodeId::deterministic("src-loss-b").value();
+
+    ContextFabric cf;
+    CF_REQUIRE(cf.connect("127.0.0.1", tc.port(), 5000));
+    const ObjectId id = cf.create_object(md_with(8192), node_a, generate_content(31, 32, 8192));
+    CF_REQUIRE(cf.replicate(id, node_b).node_id == node_b);
+
+    // A second replication is now in flight with node-a as its source: the
+    // target accepts the transfer and never completes it.
+    SilentNode silent("src-loss-silent", tc.port());
+    BlockedReplicate replicating(tc.port(), id, silent.id());
+    CF_CHECK(wait_until([&] {
+        return lifecycle_of(cf, id) == static_cast<uint32_t>(LifecycleState::Replicating);
+    }, 5000));
+
+    // The authoritative source dies while that operation is in flight.
+    na.reset();
+
+    // The operation references the dead node and must be aborted, and the
+    // object must be recovered onto its live replica. It must never return to
+    // service still naming the offline node as its authority.
+    CF_CHECK(wait_until([&] {
+        const auto ir = cf.inspect(id);
+        return ir.authoritative_node == node_b && ir.lifecycle == kAvailable;
+    }, 5000));
+
+    silent.disconnect();
+    replicating.join();
+    CF_CHECK(replicating.failed.load());
+    const auto settled = cf.inspect(id);
+    CF_CHECK(settled.authoritative_node == node_b);
+    CF_CHECK(settled.lifecycle == kAvailable);
+    CF_CHECK(cf.verify(id, node_b, true).ok);
+}
+
+CF_TEST(authority_lease_holder_disconnect_returns_object_to_available) {
+    TestCoordinator tc;
+    TestNode na("lease-loss-a", tc.port(), 64ull * 1024 * 1024, false);
+    CF_REQUIRE(wait_until([&] { return tc.coord.online_node_count() == 1; }, 10000));
+    const uint64_t node_a = NodeId::deterministic("lease-loss-a").value();
+
+    ContextFabric cf;
+    CF_REQUIRE(cf.connect("127.0.0.1", tc.port(), 5000));
+    const ObjectId id = cf.create_object(md_with(4096), node_a, generate_content(41, 42, 4096));
+
+    // A read lease held by a node other than the authoritative one. The long
+    // duration keeps lease expiry out of the picture.
+    {
+        TestNode reader("lease-loss-reader", tc.port(), 64ull * 1024 * 1024, false);
+        CF_REQUIRE(wait_until([&] { return tc.coord.online_node_count() == 2; }, 10000));
+        const Lease held =
+            cf.acquire_read_lease(id, NodeId::deterministic("lease-loss-reader").value(), 60000);
+        CF_CHECK(held.mode == LeaseMode::Read);
+        CF_CHECK(lifecycle_of(cf, id) == static_cast<uint32_t>(LifecycleState::LeasedRead));
+    }
+    // The holder is gone and its lease revoked: the object is leasable again.
+    CF_CHECK(wait_until([&] {
+        return tc.coord.online_node_count() == 1 && lifecycle_of(cf, id) == kAvailable;
+    }, 5000));
+    Lease read_again;
+    CF_CHECK_NOTHROW(read_again = cf.acquire_read_lease(id, node_a, 60000));
+    if (read_again.lease_id != 0) cf.release_lease(id, node_a, read_again.lease_id);
+
+    // The same holds for a write lease held by a non-authoritative node.
+    const uint64_t lease_generation_before = cf.inspect(id).lease_generation;
+    {
+        TestNode writer("lease-loss-writer", tc.port(), 64ull * 1024 * 1024, false);
+        CF_REQUIRE(wait_until([&] { return tc.coord.online_node_count() == 2; }, 10000));
+        const Lease held =
+            cf.acquire_write_lease(id, NodeId::deterministic("lease-loss-writer").value(), 60000);
+        CF_CHECK(held.mode == LeaseMode::Write);
+        CF_CHECK(lifecycle_of(cf, id) == static_cast<uint32_t>(LifecycleState::LeasedWrite));
+    }
+    CF_CHECK(wait_until([&] {
+        return tc.coord.online_node_count() == 1 && lifecycle_of(cf, id) == kAvailable;
+    }, 5000));
+    CF_CHECK(cf.inspect(id).lease_generation > lease_generation_before);
+    Lease write_again;
+    CF_CHECK_NOTHROW(write_again = cf.acquire_write_lease(id, node_a, 60000));
+    if (write_again.lease_id != 0) cf.release_lease(id, node_a, write_again.lease_id);
+}
+
+CF_TEST(authority_aborted_operation_does_not_restore_a_revoked_lease_lifecycle) {
+    TestCoordinator tc;
+    TestNode na("abort-lease-a", tc.port(), 64ull * 1024 * 1024, false);
+    auto reader = std::make_unique<TestNode>("abort-lease-reader", tc.port(), 64ull * 1024 * 1024, false);
+    CF_REQUIRE(wait_until([&] { return tc.coord.online_node_count() == 2; }, 10000));
+    const uint64_t node_a = NodeId::deterministic("abort-lease-a").value();
+    const uint64_t node_reader = NodeId::deterministic("abort-lease-reader").value();
+
+    ContextFabric cf;
+    CF_REQUIRE(cf.connect("127.0.0.1", tc.port(), 5000));
+    const ObjectId id = cf.create_object(md_with(4096), node_a, generate_content(51, 52, 4096));
+    const Lease held = cf.acquire_read_lease(id, node_reader, 60000);
+    CF_REQUIRE(held.lease_id != 0);
+
+    // A replication that stays in flight was started from the read-leased state.
+    SilentNode silent("abort-lease-silent", tc.port());
+    BlockedReplicate replicating(tc.port(), id, silent.id());
+    CF_CHECK(wait_until([&] {
+        return lifecycle_of(cf, id) == static_cast<uint32_t>(LifecycleState::Replicating);
+    }, 5000));
+
+    // The only lease holder dies mid-operation, then the operation aborts.
+    reader.reset();
+    CF_CHECK(wait_until([&] { return tc.coord.online_node_count() <= 2; }, 5000));
+    silent.disconnect();
+    replicating.join();
+    CF_CHECK(replicating.failed.load());
+
+    // Rolling back to "read-leased" with no lease left would refuse every
+    // later lease request; the object must settle to Available instead.
+    CF_CHECK(wait_until([&] { return lifecycle_of(cf, id) == kAvailable; }, 5000));
+    Lease again;
+    CF_CHECK_NOTHROW(again = cf.acquire_read_lease(id, node_a, 60000));
+    if (again.lease_id != 0) cf.release_lease(id, node_a, again.lease_id);
+}
+
+CF_TEST(authority_keep_source_migration_records_the_real_source_as_replica) {
+    TestCoordinator tc;
+    TestNode nb("mig-src-b", tc.port(), 64ull * 1024 * 1024, false);
+    TestNode nc("mig-src-c", tc.port(), 64ull * 1024 * 1024, false);
+    const uint64_t node_a = NodeId::deterministic("mig-src-a").value();
+    const uint64_t node_b = NodeId::deterministic("mig-src-b").value();
+    const uint64_t node_c = NodeId::deterministic("mig-src-c").value();
+
+    ContextFabric cf;
+    CF_REQUIRE(cf.connect("127.0.0.1", tc.port(), 5000));
+    ObjectId id;
+    {
+        TestNode na("mig-src-a", tc.port(), 64ull * 1024 * 1024, false);
+        CF_REQUIRE(wait_until([&] { return tc.coord.online_node_count() == 3; }, 10000));
+        id = cf.create_object(md_with(8192), node_a, generate_content(61, 62, 8192));
+        CF_REQUIRE(cf.replicate(id, node_b).node_id == node_b);
+    }
+    // node-a died, so authority was promoted onto node-b's replica.
+    CF_REQUIRE(wait_until([&] {
+        const auto ir = cf.inspect(id);
+        return ir.authoritative_node == node_b && ir.lifecycle == kAvailable;
+    }, 10000));
+
+    // Migrating on while keeping the source leaves the bytes on node-b. The
+    // replica set must name node-b, never the long-gone original owner.
+    CF_CHECK(cf.migrate(id, node_c, StorageDomain::HostMemory, true).node_id == node_c);
+    const auto ir = cf.inspect(id);
+    CF_CHECK(ir.authoritative_node == node_c);
+    CF_CHECK(std::find(ir.replica_nodes.begin(), ir.replica_nodes.end(), node_b) != ir.replica_nodes.end());
+    CF_CHECK(std::find(ir.replica_nodes.begin(), ir.replica_nodes.end(), node_a) == ir.replica_nodes.end());
+    CF_CHECK(cf.verify(id, node_b, true).ok);
 }
