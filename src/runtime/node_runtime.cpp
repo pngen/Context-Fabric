@@ -325,7 +325,9 @@ bool NodeRuntime::register_with_coordinator() {
         std::lock_guard<std::mutex> ctrl_lock(ctrl_socket_lifecycle_mutex_);
         if (!running_.load()) return false;
         ctrl_sock_.close();
-        if (!ctrl_sock_.connect(cfg_.coord_host, cfg_.coord_port, 5000)) {
+        // Cancellable: request_shutdown() must not wait out a connect to an
+        // unreachable coordinator while this thread holds the socket mutex.
+        if (!ctrl_sock_.connect(cfg_.coord_host, cfg_.coord_port, 5000, &running_)) {
             return false;
         }
     }
@@ -708,7 +710,7 @@ void NodeRuntime::do_send(const InstructSendReq& instr) {
 
     Socket peer;
     if (!peer.connect(instr.dest_addr.host, instr.dest_addr.port,
-                      (std::min)(uint64_t{10000}, remaining_timeout_ms(deadline)))) {
+                      (std::min)(uint64_t{10000}, remaining_timeout_ms(deadline)), &running_)) {
         send_data_result(instr.op_token, instr.object_id, instr.generation,
                          RpcResult::failure(ErrKind::Transport, "cannot connect to destination"), 0, 0, 0, 0);
         return;

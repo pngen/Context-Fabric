@@ -241,8 +241,11 @@ bool resolve_ipv4(const std::string& host, uint16_t port, uint64_t timeout_ms,
     return !addresses.empty();
 }
 
-// Blocking connect with timeout via select.
-bool connect_with_timeout(uintptr_t fd, const sockaddr_in& addr, uint64_t timeout_ms) {
+// Blocking connect with timeout via select. With `keep_running`, the wait is
+// sliced so a cancellation request is honoured within one short slice.
+bool connect_with_timeout(uintptr_t fd, const sockaddr_in& addr, uint64_t timeout_ms,
+                          const std::atomic<bool>* keep_running) {
+    constexpr uint64_t kCancelPollMs = 50;
     const auto deadline = deadline_after(timeout_ms);
 #if defined(_WIN32)
     u_long mode = 1;
@@ -272,8 +275,10 @@ bool connect_with_timeout(uintptr_t fd, const sockaddr_in& addr, uint64_t timeou
 #endif
 
     while (true) {
-        const uint64_t left = remaining_ms(deadline);
+        if (keep_running != nullptr && !keep_running->load(std::memory_order_acquire)) return false;
+        uint64_t left = remaining_ms(deadline);
         if (left == 0) return false;
+        if (keep_running != nullptr) left = std::min<uint64_t>(left, kCancelPollMs);
         fd_set wset;
         FD_ZERO(&wset);
         FD_SET(to_fd(fd), &wset);
@@ -287,7 +292,13 @@ bool connect_with_timeout(uintptr_t fd, const sockaddr_in& addr, uint64_t timeou
         rc = ::select(to_fd(fd) + 1, nullptr, &wset, nullptr, &tv);
         if (rc < 0 && errno == EINTR) continue;
 #endif
-        if (rc <= 0) return false;
+        if (rc < 0) return false;
+        if (rc == 0) {
+            // A cancellable wait only finished one slice; the overall
+            // deadline is re-evaluated at the top of the loop.
+            if (keep_running != nullptr) continue;
+            return false;
+        }
         break;
     }
 
@@ -326,7 +337,8 @@ Socket& Socket::operator=(Socket&& other) noexcept {
 
 Socket::~Socket() { close(); }
 
-bool Socket::connect(const std::string& host, uint16_t port, uint64_t timeout_ms) {
+bool Socket::connect(const std::string& host, uint16_t port, uint64_t timeout_ms,
+                     const std::atomic<bool>* keep_running) {
     close();
     if (host.empty() || port == 0 || timeout_ms == 0) return false;
     const auto deadline = deadline_after(timeout_ms);
@@ -350,7 +362,7 @@ bool Socket::connect(const std::string& host, uint16_t port, uint64_t timeout_ms
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 #endif
 
-        if (connect_with_timeout(fd_, address, left)) {
+        if (connect_with_timeout(fd_, address, left, keep_running)) {
             ok = true;
             break;
         }

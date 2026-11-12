@@ -284,6 +284,27 @@ CF_TEST(node_runtime_rejects_unserviceable_configs_and_restarts_cleanly) {
     }
 }
 
+CF_TEST(node_runtime_shutdown_interrupts_a_pending_coordinator_connect) {
+    Telemetry telemetry;
+    telemetry.set_stderr_enabled(false);
+    NodeConfig config;
+    config.node_id = NodeId::deterministic("pending-connect-runtime");
+    config.coord_port = 1;  // nothing listens here
+    config.host_capacity = 1024 * 1024;
+    config.transfer_workers = 1;
+    NodeRuntime runtime(config, telemetry);
+    CF_REQUIRE(runtime.start());
+    // Let the control thread get into its registration attempt. Where a
+    // refused connect is only reported at the connect timeout, that thread is
+    // now blocked for seconds while holding the control-socket mutex.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const auto begin = std::chrono::steady_clock::now();
+    runtime.shutdown();
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    CF_CHECK(elapsed < std::chrono::seconds(1));
+    CF_CHECK(runtime.data_port() == 0);
+}
+
 CF_TEST(node_runtime_shutdown_wakes_workers_that_are_entering_their_wait) {
     // A peer that accepts and immediately hangs up makes every registration
     // attempt fail fast, so each start/shutdown cycle is cheap. What remains

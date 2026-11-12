@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -33,8 +34,11 @@ public:
     // share `timeout_ms`; Windows hostname resolution uses the same deadline.
     // POSIX hostname resolution inherits the system resolver's own deadline
     // because getaddrinfo has no portable cancellation API. Returns false on
-    // failure (peer refused, timeout, DNS failure).
-    bool connect(const std::string& host, uint16_t port, uint64_t timeout_ms);
+    // failure (peer refused, timeout, DNS failure). When `keep_running` is
+    // supplied, a pending attempt is abandoned promptly once it reads false,
+    // so an owner that is shutting down never waits out the full timeout.
+    bool connect(const std::string& host, uint16_t port, uint64_t timeout_ms,
+                 const std::atomic<bool>* keep_running = nullptr);
 
     // Bind+listen on host:port (port 0 = ephemeral). On success sets
     // `bound_port` to the actual bound port.
